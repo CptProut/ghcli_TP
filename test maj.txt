@@ -1,0 +1,525 @@
+// ============================================================
+//  CONFIGURATION — À adapter à votre environnement
+// ============================================================
+const CONFIG = {
+  // IDs des fichiers Google Sheets
+  INVENTAIRE_SHEET_ID: "COLLER_ICI_L_ID_DE_L_INVENTAIRE",
+  EXTRACT_SHEET_ID:    "COLLER_ICI_L_ID_DU_FICHIER_EXTRACT",
+
+  // Noms des onglets
+  INVENTAIRE_TAB:  "Inventaire serveurs",  // Onglet de l'inventaire maître
+  EXTRACT_TAB:     "Feuille 1",            // Onglet du fichier extract hebdo
+
+  // Colonne clé dans l'INVENTAIRE (identifiant unique, ex: "INV-XYZFGH")
+  // Numéro de colonne dans l'inventaire (1 = col A)
+  INVENTAIRE_KEY_COL: 1,   // Colonne "Identifiant"
+
+  // Colonne clé dans l'EXTRACT (colonne "ID" = colonne 1)
+  EXTRACT_KEY_COL: 1,
+
+  // Email(s) de notification (séparés par des virgules)
+  NOTIFICATION_EMAILS: "votre@email.com",
+
+  // Onglet rapport (sera créé/écrasé dans l'inventaire)
+  RAPPORT_TAB: "Rapport_Sync",
+
+  // Correspondance entre colonnes EXTRACT et colonnes INVENTAIRE
+  // Format : { "nom colonne inventaire": { extractCol: N, type: "discovery"|"inventaire" } }
+  // On prend toujours la valeur DISCOVERY pour mettre à jour l'inventaire
+  MAPPING: {
+    // Colonne inventaire         colonne extract (1-indexé)
+    "Nom":              { col: 4  },   // nom discovery
+    "Fabriquant":       { col: 7  },   // fabriquant discovery
+    "Modèle":           { col: 10 },   // Modelme discovery
+    "Numero de Serie":  { col: 13 },   // num serie discovery
+    "Domaine":          { col: 16 },   // domaine discovery
+    "FQDN":             { col: 19 },   // fqdn discovery
+    "Environement":     { col: 22 },   // environement discovery
+    "Hébergement ":     { col: 25 },   // hebergement discovery
+    "Statut":           { col: 28 },   // statut discovery
+    "PCI DSS":          { col: 31 },   // Pci dss discovery
+    "OS ":              { col: 34 },   // os discovery
+    "OS Build":         { col: 37 },   // os build discovery
+    "Cpu":              { col: 43 },   // cpu discovery
+    "Memory":           { col: 46 },   // memoire discovery
+    "DiskSizeGb":       { col: 49 },   // disksizegb discovery
+    "IP":               { col: 52 },   // adresse ip discovery
+    "Adresse MAC":      { col: 55 },   // adresse mac discovery
+    "type":             { col: 58 },   // type discovery
+    "Blacklist Discovery": { col: 61 }, // blacklist discovery
+  },
+
+  // Colonne "match" dans l'extract : indique si inventaire = discovery
+  // On ne met à jour QUE si match = "NON" (ou vide, ou "0")
+  // Index de la colonne match pour chaque champ (ex: col 5 = nom match)
+  MATCH_COLS: {
+    "Nom":              5,
+    "Fabriquant":       8,
+    "Modèle":           11,
+    "Numero de Serie":  14,
+    "Domaine":          17,
+    "FQDN":             20,
+    "Environement":     23,
+    "Hébergement ":     26,
+    "Statut":           29,
+    "PCI DSS":          32,
+    "OS ":              35,
+    "OS Build":         38,
+    "Cpu":              44,
+    "Memory":           47,
+    "DiskSizeGb":       50,
+    "IP":               53,
+    "Adresse MAC":      56,
+    "type":             59,
+    "Blacklist Discovery": 62,
+  },
+
+  // Colonnes de l'inventaire (1-indexé) pour chaque champ
+  INVENTAIRE_COLS: {
+    "Nom":              2,
+    "Fabriquant":       5,
+    "Modèle":           6,
+    "Numero de Serie":  7,
+    "Domaine":          8,
+    "FQDN":             9,
+    "Environement":     11,
+    "Hébergement ":     18,
+    "Statut":           30,
+    "PCI DSS":          12,
+    "OS ":              13,
+    "OS Build":         14,
+    "Cpu":              23,
+    "Memory":           24,
+    "DiskSizeGb":       25,
+    "IP":               15,
+    "Adresse MAC":      16,
+    "type":             34,
+    "Blacklist Discovery": 31,
+  },
+};
+
+// ============================================================
+//  MENU
+// ============================================================
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("🔄 Sync Inventaire")
+    .addItem("▶️ Lancer la synchronisation", "lancerSync")
+    .addItem("👁️ Aperçu sans modification", "lancerApercu")
+    .addItem("📋 Ouvrir le dernier rapport", "ouvrirRapport")
+    .addSeparator()
+    .addItem("⚙️ Aide", "afficherAide")
+    .addToUi();
+}
+
+// ============================================================
+//  POINT D'ENTRÉE PRINCIPAL
+// ============================================================
+function lancerSync() {
+  _executer(false);
+}
+
+function lancerApercu() {
+  _executer(true);
+}
+
+function _executer(apercuSeulement) {
+  const ui = SpreadsheetApp.getUi();
+  const label = apercuSeulement ? "APERÇU" : "SYNCHRONISATION";
+
+  try {
+    Logger.log(`=== Début ${label} ===`);
+
+    // 1. Charger les données
+    const invSS    = SpreadsheetApp.openById(CONFIG.INVENTAIRE_SHEET_ID);
+    const extSS    = SpreadsheetApp.openById(CONFIG.EXTRACT_SHEET_ID);
+    const invSheet = invSS.getSheetByName(CONFIG.INVENTAIRE_TAB);
+    const extSheet = extSS.getSheetByName(CONFIG.EXTRACT_TAB);
+
+    if (!invSheet) throw new Error(`Onglet inventaire "${CONFIG.INVENTAIRE_TAB}" introuvable.`);
+    if (!extSheet) throw new Error(`Onglet extract "${CONFIG.EXTRACT_TAB}" introuvable.`);
+
+    const invData  = invSheet.getDataRange().getValues();
+    const extData  = extSheet.getDataRange().getValues();
+
+    // 2. Indexer l'inventaire par clé
+    const invIndex = {};
+    for (let i = 1; i < invData.length; i++) {
+      const key = String(invData[i][CONFIG.INVENTAIRE_KEY_COL - 1]).trim();
+      if (key) invIndex[key] = i; // index de ligne dans invData
+    }
+
+    // 3. Parcourir l'extract et identifier les écarts
+    const actions = []; // {key, champ, ancienne, nouvelle, invRow, invCol}
+
+    for (let e = 1; e < extData.length; e++) {
+      const row      = extData[e];
+      const key      = String(row[CONFIG.EXTRACT_KEY_COL - 1]).trim();
+      if (!key) continue;
+
+      const invRowIdx = invIndex[key];
+      if (invRowIdx === undefined) {
+        // Clé absente de l'inventaire — on log mais on n'ajoute pas (choix conservateur)
+        Logger.log(`⚠️ Clé "${key}" présente dans l'extract mais absente de l'inventaire.`);
+        continue;
+      }
+
+      // Pour chaque champ mappé, vérifier la colonne match
+      for (const [champ, matchCol] of Object.entries(CONFIG.MATCH_COLS)) {
+        const matchVal = String(row[matchCol - 1] ?? "").trim();
+
+        // ✅ Coche verte  → inventaire = discovery, rien à faire
+        // –  Tiret        → pas de donnée discovery, rien à faire
+        // ❌ Croix rouge  → différence détectée, on met à jour
+        const estOk     = matchVal === "✅" || matchVal === "☑" || matchVal === "✔" || matchVal === "✓";
+        const estTiret  = matchVal === "–"  || matchVal === "-" || matchVal === "—" || matchVal === "";
+        const estEcart  = matchVal === "❌" || matchVal === "✗" || matchVal === "✘" || matchVal === "×";
+
+        if (estOk || estTiret) continue;  // Coche verte ou tiret → on skip
+        if (!estEcart) {
+          // Valeur inattendue : on log et on skip par sécurité
+          Logger.log(`⚠️ Valeur de match inconnue pour "${champ}" (clé ${key}) : "${matchVal}" — ignoré`);
+          continue;
+        }
+
+        const discoveryVal = String(row[CONFIG.MAPPING[champ].col - 1] ?? "").trim();
+        if (!discoveryVal) continue; // pas de valeur discovery, rien à faire
+
+        const invColIdx    = CONFIG.INVENTAIRE_COLS[champ] - 1;
+        const invActuelle  = String(invData[invRowIdx][invColIdx] ?? "").trim();
+
+        if (discoveryVal !== invActuelle) {
+          actions.push({
+            key,
+            champ,
+            ancienne:  invActuelle,
+            nouvelle:  discoveryVal,
+            invRowSheet: invRowIdx + 1,    // ligne réelle dans la sheet (1-indexé)
+            invColSheet: CONFIG.INVENTAIRE_COLS[champ], // colonne réelle
+          });
+        }
+      }
+    }
+
+    if (actions.length === 0) {
+      ui.alert("✅ Déjà à jour", "Aucune différence détectée entre l'extract et l'inventaire.", ui.ButtonSet.OK);
+      return;
+    }
+
+    // 4. Afficher l'aperçu
+    const resume = _genererResume(actions);
+
+    if (apercuSeulement) {
+      ui.alert("👁️ Aperçu des mises à jour", resume + "\n\nAucune modification effectuée.", ui.ButtonSet.OK);
+      _ecrireRapport(invSS, actions, false);
+      return;
+    }
+
+    // 5. Confirmation
+    const conf = ui.alert(
+      "⚠️ Confirmer la synchronisation",
+      resume + "\n\nCes modifications seront appliquées à l'inventaire.\nContinuer ?",
+      ui.ButtonSet.YES_NO
+    );
+    if (conf !== ui.Button.YES) {
+      ui.alert("Annulé", "Aucune modification effectuée.", ui.ButtonSet.OK);
+      return;
+    }
+
+    // 6. Appliquer les modifications avec notification en temps réel
+    _appliquerModifications(invSheet, actions);
+
+    // 7. Générer le rapport
+    _ecrireRapport(invSS, actions, true);
+
+    // 8. Envoyer email de notification
+    _envoyerEmail(actions);
+
+    ui.alert(
+      "✅ Synchronisation terminée",
+      `${actions.length} champ(s) mis à jour dans l'inventaire.\n\nUn rapport complet a été généré dans l'onglet "${CONFIG.RAPPORT_TAB}".\nUn email de synthèse a été envoyé à ${CONFIG.NOTIFICATION_EMAILS}.`,
+      ui.ButtonSet.OK
+    );
+
+  } catch (e) {
+    Logger.log("ERREUR : " + e.message);
+    ui.alert("❌ Erreur", e.message, ui.ButtonSet.OK);
+  }
+}
+
+// ============================================================
+//  APPLIQUER LES MODIFICATIONS (avec toast en temps réel)
+// ============================================================
+function _appliquerModifications(invSheet, actions) {
+  const ss = invSheet.getParent();
+  let count = 0;
+
+  for (const action of actions) {
+    count++;
+    // 🔔 Message en temps réel visible sur la sheet
+    ss.toast(
+      `[${count}/${actions.length}] "${action.champ}" → "${action.nouvelle}"`,
+      `🔄 Mise à jour : ${action.key}`,
+      3 // secondes d'affichage
+    );
+
+    const cell = invSheet.getRange(action.invRowSheet, action.invColSheet);
+    cell.setValue(action.nouvelle);
+
+    // Surligner en jaune la cellule modifiée
+    cell.setBackground("#FFF59D");
+    cell.setNote(`Mis à jour par Discovery le ${new Date().toLocaleString("fr-FR")}\nAncienne valeur : "${action.ancienne}"`);
+
+    // Petite pause pour que le toast soit visible
+    Utilities.sleep(200);
+  }
+
+  // Toast final
+  ss.toast(`${actions.length} champ(s) mis à jour avec succès.`, "✅ Synchronisation terminée", 5);
+}
+
+// ============================================================
+//  RÉSUMÉ TEXTE (pour boîte de dialogue)
+// ============================================================
+function _genererResume(actions) {
+  // Grouper par clé
+  const parCle = {};
+  for (const a of actions) {
+    if (!parCle[a.key]) parCle[a.key] = [];
+    parCle[a.key].push(a);
+  }
+
+  const nbCles = Object.keys(parCle).length;
+  let msg = `📊 ${actions.length} différence(s) trouvée(s) sur ${nbCles} serveur(s) :\n`;
+  msg += "─".repeat(45) + "\n";
+
+  let shown = 0;
+  for (const [key, items] of Object.entries(parCle)) {
+    if (shown >= 10) { msg += `\n... et ${nbCles - shown} autre(s) serveur(s)`; break; }
+    msg += `\n🖥️ ${key} (${items.length} champ(s))\n`;
+    for (const item of items.slice(0, 4)) {
+      msg += `   • ${item.champ}: "${item.ancienne}" → "${item.nouvelle}"\n`;
+    }
+    if (items.length > 4) msg += `   ... +${items.length - 4} autre(s)\n`;
+    shown++;
+  }
+
+  return msg;
+}
+
+// ============================================================
+//  RAPPORT COMPLET
+// ============================================================
+function _ecrireRapport(invSS, actions, applique) {
+  let sheet = invSS.getSheetByName(CONFIG.RAPPORT_TAB);
+  if (sheet) { sheet.clearContents(); sheet.clearFormats(); }
+  else sheet = invSS.insertSheet(CONFIG.RAPPORT_TAB);
+
+  const now    = new Date();
+  const statut = applique ? "✅ APPLIQUÉ" : "👁️ APERÇU (non appliqué)";
+  const couleurStatut = applique ? "#34A853" : "#FBBC05";
+
+  // ── Titre ──
+  sheet.getRange("A1:G1").merge()
+    .setValue(`Rapport de synchronisation Discovery → Inventaire`)
+    .setFontSize(14).setFontWeight("bold")
+    .setBackground("#1a73e8").setFontColor("white")
+    .setHorizontalAlignment("center");
+
+  sheet.getRange("A2:G2").merge()
+    .setValue(`${now.toLocaleString("fr-FR")}   |   Statut : ${statut}`)
+    .setBackground(couleurStatut).setFontColor("white")
+    .setHorizontalAlignment("center").setFontWeight("bold");
+
+  // ── Résumé chiffré ──
+  const parCle   = {};
+  const parChamp = {};
+  for (const a of actions) {
+    parCle[a.key]     = (parCle[a.key]     || 0) + 1;
+    parChamp[a.champ] = (parChamp[a.champ] || 0) + 1;
+  }
+
+  sheet.getRange("A4:B4").setValues([["Serveurs impactés", Object.keys(parCle).length]])
+    .setFontWeight("bold");
+  sheet.getRange("A5:B5").setValues([["Champs mis à jour", actions.length]]);
+  sheet.getRange("A6:B6").setValues([["Date de traitement", now.toLocaleDateString("fr-FR")]]);
+
+  // ── En-têtes du détail ──
+  const headers = ["Identifiant", "Champ modifié", "Ancienne valeur (Inventaire)", "Nouvelle valeur (Discovery)", "Ligne inventaire", "Colonne inventaire", "Statut"];
+  const hRow = 9;
+  sheet.getRange(hRow, 1, 1, headers.length).setValues([headers])
+    .setFontWeight("bold").setBackground("#E8F0FE")
+    .setBorder(true, true, true, true, true, true);
+
+  // ── Données ──
+  const rows = actions.map(a => [
+    a.key,
+    a.champ,
+    a.ancienne,
+    a.nouvelle,
+    a.invRowSheet,
+    a.invColSheet,
+    applique ? "✅ Mis à jour" : "⏳ En attente",
+  ]);
+
+  if (rows.length > 0) {
+    sheet.getRange(hRow + 1, 1, rows.length, headers.length).setValues(rows);
+
+    // Zebra stripes
+    for (let i = 0; i < rows.length; i++) {
+      const bg = i % 2 === 0 ? "#FFFFFF" : "#F8F9FA";
+      sheet.getRange(hRow + 1 + i, 1, 1, headers.length).setBackground(bg);
+    }
+  }
+
+  // ── Répartition par champ ──
+  let startCol = 9;
+  sheet.getRange(4, startCol).setValue("Champ").setFontWeight("bold").setBackground("#E8F0FE");
+  sheet.getRange(4, startCol + 1).setValue("Nb écarts").setFontWeight("bold").setBackground("#E8F0FE");
+  let r = 5;
+  for (const [champ, nb] of Object.entries(parChamp).sort((a, b) => b[1] - a[1])) {
+    sheet.getRange(r, startCol).setValue(champ);
+    sheet.getRange(r, startCol + 1).setValue(nb);
+    r++;
+  }
+
+  sheet.autoResizeColumns(1, headers.length + 2);
+
+  Logger.log(`Rapport écrit : ${rows.length} ligne(s) dans l'onglet "${CONFIG.RAPPORT_TAB}"`);
+}
+
+// ============================================================
+//  EMAIL DE NOTIFICATION
+// ============================================================
+function _envoyerEmail(actions) {
+  const now    = new Date();
+  const parCle = {};
+  const parChamp = {};
+
+  for (const a of actions) {
+    if (!parCle[a.key]) parCle[a.key] = [];
+    parCle[a.key].push(a);
+    parChamp[a.champ] = (parChamp[a.champ] || 0) + 1;
+  }
+
+  // ── Corps HTML ──
+  let tableRows = "";
+  for (const a of actions) {
+    tableRows += `
+      <tr>
+        <td style="padding:6px 10px;border:1px solid #ddd;">${a.key}</td>
+        <td style="padding:6px 10px;border:1px solid #ddd;">${a.champ}</td>
+        <td style="padding:6px 10px;border:1px solid #ddd;color:#c62828;">${a.ancienne || "(vide)"}</td>
+        <td style="padding:6px 10px;border:1px solid #ddd;color:#2e7d32;">${a.nouvelle}</td>
+      </tr>`;
+  }
+
+  let champStats = Object.entries(parChamp)
+    .sort((a, b) => b[1] - a[1])
+    .map(([c, n]) => `<li><b>${c}</b> : ${n} mise(s) à jour</li>`)
+    .join("");
+
+  const html = `
+  <div style="font-family:Arial,sans-serif;max-width:900px;">
+    <div style="background:#1a73e8;color:white;padding:16px 24px;border-radius:8px 8px 0 0;">
+      <h2 style="margin:0;">🔄 Rapport de synchronisation Discovery → Inventaire</h2>
+      <p style="margin:4px 0 0;">${now.toLocaleString("fr-FR")}</p>
+    </div>
+
+    <div style="background:#f8f9fa;padding:16px 24px;border:1px solid #e0e0e0;">
+      <h3 style="color:#1a73e8;">📊 Résumé</h3>
+      <ul>
+        <li><b>${Object.keys(parCle).length}</b> serveur(s) impacté(s)</li>
+        <li><b>${actions.length}</b> champ(s) mis à jour</li>
+      </ul>
+      <h3 style="color:#1a73e8;">📈 Répartition par champ</h3>
+      <ul>${champStats}</ul>
+    </div>
+
+    <div style="padding:16px 24px;border:1px solid #e0e0e0;border-top:none;">
+      <h3 style="color:#1a73e8;">📋 Détail des modifications</h3>
+      <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <thead>
+          <tr style="background:#e8f0fe;">
+            <th style="padding:8px 10px;border:1px solid #ddd;text-align:left;">Identifiant</th>
+            <th style="padding:8px 10px;border:1px solid #ddd;text-align:left;">Champ</th>
+            <th style="padding:8px 10px;border:1px solid #ddd;text-align:left;">Ancienne valeur</th>
+            <th style="padding:8px 10px;border:1px solid #ddd;text-align:left;">Nouvelle valeur (Discovery)</th>
+          </tr>
+        </thead>
+        <tbody>${tableRows}</tbody>
+      </table>
+    </div>
+
+    <div style="background:#f1f3f4;padding:12px 24px;border-radius:0 0 8px 8px;font-size:12px;color:#666;">
+      Synchronisation automatique — Inventaire IT | Script Apps Script
+    </div>
+  </div>`;
+
+  MailApp.sendEmail({
+    to:      CONFIG.NOTIFICATION_EMAILS,
+    subject: `[Inventaire IT] Sync Discovery — ${actions.length} mise(s) à jour — ${now.toLocaleDateString("fr-FR")}`,
+    htmlBody: html,
+  });
+
+  Logger.log("Email envoyé à : " + CONFIG.NOTIFICATION_EMAILS);
+}
+
+// ============================================================
+//  DÉCLENCHEUR AUTOMATIQUE CHAQUE LUNDI
+// ============================================================
+function creerDeclencheurLundi() {
+  // Supprime les anciens déclencheurs pour éviter les doublons
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "lancerSync") ScriptApp.deleteTrigger(t);
+  });
+
+  // Crée un déclencheur chaque lundi entre 8h et 9h
+  ScriptApp.newTrigger("lancerSync")
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.MONDAY)
+    .atHour(8)
+    .create();
+
+  SpreadsheetApp.getUi().alert(
+    "✅ Déclencheur créé",
+    "La synchronisation se lancera automatiquement chaque lundi entre 8h et 9h.",
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+// ============================================================
+//  OUVRIR RAPPORT
+// ============================================================
+function ouvrirRapport() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const invSS = SpreadsheetApp.openById(CONFIG.INVENTAIRE_SHEET_ID);
+    const r     = invSS.getSheetByName(CONFIG.RAPPORT_TAB);
+    if (!r) {
+      ui.alert("Aucun rapport", "Lancez d'abord une synchronisation ou un aperçu.", ui.ButtonSet.OK);
+    } else {
+      ui.alert("📋 Rapport disponible", `Consultez l'onglet "${CONFIG.RAPPORT_TAB}" dans l'inventaire.`, ui.ButtonSet.OK);
+    }
+  } catch(e) { ui.alert("Erreur", e.message, ui.ButtonSet.OK); }
+}
+
+// ============================================================
+//  AIDE
+// ============================================================
+function afficherAide() {
+  SpreadsheetApp.getUi().alert("⚙️ Configuration", `
+1. Ouvrez Extensions > Apps Script dans l'inventaire
+2. Collez ce script et configurez la section CONFIG :
+   - INVENTAIRE_SHEET_ID  → ID de l'inventaire (dans l'URL)
+   - EXTRACT_SHEET_ID     → ID du fichier extract hebdo
+   - INVENTAIRE_TAB       → Nom de l'onglet inventaire
+   - EXTRACT_TAB          → Nom de l'onglet extract
+   - NOTIFICATION_EMAILS  → Email(s) pour les rapports
+3. Sauvegardez et rechargez la sheet
+4. Lancez "Créer le déclencheur lundi" pour l'automatisation
+
+📌 L'ID se trouve dans l'URL :
+   docs.google.com/spreadsheets/d/[ID]/edit
+  `, SpreadsheetApp.getUi().ButtonSet.OK);
+}
