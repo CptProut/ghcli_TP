@@ -12,12 +12,14 @@ const CONFIG = {
   INVENTAIRE_TAB:  "Inventaire serveurs",  // Onglet de l'inventaire maître
   EXTRACT_TAB:     "Feuille 1",            // Onglet du fichier extract hebdo
 
-  // Colonne clé dans l'INVENTAIRE (identifiant unique, ex: "INV-XYZFGH")
-  // Numéro de colonne dans l'inventaire (1 = col A)
+  // Colonne cle dans l'INVENTAIRE (identifiant unique, ex: "INV-XYZFGH")
   INVENTAIRE_KEY_COL: 1,   // Colonne "Identifiant"
+  // Colonne nom machine dans l'INVENTAIRE (utilisee comme cle de fallback)
+  INVENTAIRE_NOM_COL: 2,   // Colonne "Nom"
 
-  // Colonne clé dans l'EXTRACT (colonne "ID" = colonne 1)
-  EXTRACT_KEY_COL: 1,
+  // Colonnes dans l'EXTRACT
+  EXTRACT_KEY_COL: 1,      // Colonne "ID"
+  EXTRACT_NOM_COL: 3,      // Colonne "Nom inventaire" (fallback pour nouvelles machines)
 
   // Email(s) de notification (séparés par des virgules)
   NOTIFICATION_EMAILS: "votre@email.com",
@@ -244,25 +246,48 @@ function _executer(apercuSeulement) {
     const invData  = invSheet.getDataRange().getValues();
     const extData  = extSheet.getDataRange().getValues();
 
-    // 2. Indexer l'inventaire par clé
-    const invIndex = {};
+    // 2. Indexer l'inventaire par identifiant ET par nom de machine
+    const invIndexParId  = {};  // INV-XXXXX -> index ligne
+    const invIndexParNom = {};  // nom machine (lowercase) -> index ligne
+
     for (let i = 1; i < invData.length; i++) {
-      const key = String(invData[i][CONFIG.INVENTAIRE_KEY_COL - 1]).trim();
-      if (key) invIndex[key] = i; // index de ligne dans invData
+      const id  = String(invData[i][CONFIG.INVENTAIRE_KEY_COL - 1]).trim();
+      const nom = String(invData[i][CONFIG.INVENTAIRE_NOM_COL - 1]).trim().toLowerCase();
+      if (id)  invIndexParId[id]   = i;
+      if (nom) invIndexParNom[nom] = i;
     }
 
-    // 3. Parcourir l'extract et identifier les écarts
-    const actions = []; // {key, champ, ancienne, nouvelle, invRow, invCol}
+    // 3. Parcourir l'extract et identifier les ecarts
+    const actions        = [];
+    const nonTrouves     = []; // lignes sans correspondance dans l'inventaire
 
     for (let e = 1; e < extData.length; e++) {
-      const row      = extData[e];
-      const key      = String(row[CONFIG.EXTRACT_KEY_COL - 1]).trim();
+      const row = extData[e];
+      const key = String(row[CONFIG.EXTRACT_KEY_COL - 1]).trim();
       if (!key) continue;
 
-      const invRowIdx = invIndex[key];
+      let invRowIdx   = undefined;
+      let modeMatch   = "";
+
+      // Cas 1 : clé est un vrai identifiant INV- et existe dans l'inventaire
+      if (/^INV-/i.test(key) && invIndexParId[key] !== undefined) {
+        invRowIdx = invIndexParId[key];
+        modeMatch = "id";
+
+      // Cas 2 : clé absente ou nouvelle machine -> fallback sur le nom de la machine
+      } else {
+        // La colonne "nom inventaire" dans l'extract (col 3 = index 2)
+        const nomExtract = String(row[CONFIG.EXTRACT_NOM_COL - 1]).trim().toLowerCase();
+        if (nomExtract && invIndexParNom[nomExtract] !== undefined) {
+          invRowIdx = invIndexParNom[nomExtract];
+          modeMatch = "nom";
+          Logger.log(`INFO : Cle "${key}" non trouvee par ID, correspondance par nom "${nomExtract}"`);
+        }
+      }
+
       if (invRowIdx === undefined) {
-        // Clé absente de l'inventaire — on log mais on n'ajoute pas (choix conservateur)
-        Logger.log(`⚠️ Clé "${key}" présente dans l'extract mais absente de l'inventaire.`);
+        nonTrouves.push(key);
+        Logger.log(`SKIP : "${key}" absent de l'inventaire (ni par ID ni par nom)`);
         continue;
       }
 
@@ -304,6 +329,7 @@ function _executer(apercuSeulement) {
           nouvelle:    discoveryVal,
           invRowSheet: invRowIdx + 1,
           invColSheet: CONFIG.INVENTAIRE_COLS[champ],
+          modeMatch,   // "id" ou "nom" — pour traçabilité dans le rapport
         });
       }
     }
@@ -313,16 +339,31 @@ function _executer(apercuSeulement) {
       return;
     }
 
-    // 4. Afficher l'aperçu
+    // 4. Alerte nouvelles machines (Cas 5) — avant tout le reste
+    if (nonTrouves.length > 0) {
+      const listeMachines = nonTrouves.map(k => `  • ${k}`).join("\n");
+      ui.alert(
+        "🆕 Nouvelles machines détectées — Action opérateur requise",
+        `${nonTrouves.length} machine(s) présente(s) dans l'extract n'ont pas été trouvées dans l'inventaire` +
+        ` (ni par ID ni par nom).\n\n` +
+        `Ces machines sont à la charge de l'opérateur pour être ajoutées manuellement à l'inventaire :\n\n` +
+        `${listeMachines}\n\n` +
+        `ℹ️ Ces entrées seront également listées dans le rapport final.\n` +
+        `La synchronisation des autres machines va continuer.`,
+        ui.ButtonSet.OK
+      );
+    }
+
+    // 5. Afficher l'aperçu
     const resume = _genererResume(actions);
 
     if (apercuSeulement) {
       ui.alert("👁️ Aperçu des mises à jour", resume + "\n\nAucune modification effectuée.", ui.ButtonSet.OK);
-      _ecrireRapport(invSS, actions, false);
+      _ecrireRapport(invSS, actions, false, nonTrouves);
       return;
     }
 
-    // 5. Confirmation
+    // 6. Confirmation
     const conf = ui.alert(
       "⚠️ Confirmer la synchronisation",
       resume + "\n\nCes modifications seront appliquées à l'inventaire.\nContinuer ?",
@@ -337,7 +378,7 @@ function _executer(apercuSeulement) {
     _appliquerModifications(invSheet, actions);
 
     // 7. Générer le rapport
-    _ecrireRapport(invSS, actions, true);
+    _ecrireRapport(invSS, actions, true, nonTrouves);
 
     // 8. Envoyer email de notification
     _envoyerEmail(actions);
@@ -477,7 +518,7 @@ function _genererResume(actions) {
 // ============================================================
 //  RAPPORT COMPLET
 // ============================================================
-function _ecrireRapport(invSS, actions, applique) {
+function _ecrireRapport(invSS, actions, applique, nonTrouves) {
   let sheet = invSS.getSheetByName(CONFIG.RAPPORT_TAB);
   if (sheet) { sheet.clearContents(); sheet.clearFormats(); }
   else sheet = invSS.insertSheet(CONFIG.RAPPORT_TAB);
@@ -512,7 +553,7 @@ function _ecrireRapport(invSS, actions, applique) {
   sheet.getRange("A6:B6").setValues([["Date de traitement", now.toLocaleDateString("fr-FR")]]);
 
   // ── En-têtes du détail ──
-  const headers = ["Identifiant", "Champ modifié", "Ancienne valeur (Inventaire)", "Nouvelle valeur (Discovery)", "Ligne inventaire", "Colonne inventaire", "Statut"];
+  const headers = ["Identifiant", "Champ modifié", "Ancienne valeur (Inventaire)", "Nouvelle valeur (Discovery)", "Correspondance", "Statut"];
   const hRow = 9;
   sheet.getRange(hRow, 1, 1, headers.length).setValues([headers])
     .setFontWeight("bold").setBackground("#E8F0FE")
@@ -524,8 +565,7 @@ function _ecrireRapport(invSS, actions, applique) {
     a.champ,
     a.ancienne,
     a.nouvelle,
-    a.invRowSheet,
-    a.invColSheet,
+    a.modeMatch === "nom" ? "Par nom (nouvelle machine)" : "Par ID",
     (() => {
           if (!applique) return "En attente";
           if (a.statut === "ECHEC")         return "ECHEC - " + (a.erreur || "");
@@ -553,6 +593,20 @@ function _ecrireRapport(invSS, actions, applique) {
     sheet.getRange(r, startCol).setValue(champ);
     sheet.getRange(r, startCol + 1).setValue(nb);
     r++;
+  }
+
+  // Section machines non trouvées
+  if (nonTrouves && nonTrouves.length > 0) {
+    let lastRow = sheet.getLastRow() + 2;
+    sheet.getRange(lastRow, 1, 1, 3)
+      .setValues([["Machines non trouvées dans l'inventaire (ni par ID ni par nom)", "", ""]])
+      .setFontWeight("bold").setBackground("#FFCDD2");
+    sheet.getRange(lastRow, 1, 1, 3).merge();
+    lastRow++;
+    nonTrouves.forEach(k => {
+      sheet.getRange(lastRow, 1).setValue(k);
+      lastRow++;
+    });
   }
 
   sheet.autoResizeColumns(1, headers.length + 2);
