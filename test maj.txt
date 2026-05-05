@@ -353,31 +353,91 @@ function _executer(apercuSeulement) {
 //  APPLIQUER LES MODIFICATIONS (avec toast en temps réel)
 // ============================================================
 function _appliquerModifications(invSheet, actions) {
-  const ss = invSheet.getParent();
-  let count = 0;
+  const ss      = invSheet.getParent();
+  const dateMAJ = new Date().toLocaleString("fr-FR");
+  let count     = 0;
 
   for (const action of actions) {
     count++;
-    // 🔔 Message en temps réel visible sur la sheet
+
     ss.toast(
-      `[${count}/${actions.length}] "${action.champ}" → "${action.nouvelle}"`,
-      `🔄 Mise à jour : ${action.key}`,
-      3 // secondes d'affichage
+      `[${count}/${actions.length}] "${action.champ}" -> "${action.nouvelle}"`,
+      `Mise a jour : ${action.key}`,
+      3
     );
 
     const cell = invSheet.getRange(action.invRowSheet, action.invColSheet);
-    cell.setValue(action.nouvelle);
 
-    // Surligner en jaune la cellule modifiée
-    cell.setBackground("#FFF59D");
-    cell.setNote(`Mis à jour par Discovery le ${new Date().toLocaleString("fr-FR")}\nAncienne valeur : "${action.ancienne}"`);
+    try {
+      const validation = cell.getDataValidation();
 
-    // Petite pause pour que le toast soit visible
+      if (validation) {
+        const criteria = validation.getCriteriaType();
+        const isDdl    = criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST
+                      || criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_RANGE;
+
+        if (isDdl) {
+          let valeursAutorisees = [];
+          if (criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
+            valeursAutorisees = validation.getCriteriaValues()[0] || [];
+          }
+
+          const valeurNorm = String(action.nouvelle).trim();
+          const estAutorisee = valeursAutorisees.length === 0 ||
+            valeursAutorisees.some(v => String(v).trim().toLowerCase() === valeurNorm.toLowerCase());
+
+          if (estAutorisee) {
+            cell.setValue(action.nouvelle);
+            action.statut = "OK";
+          } else {
+            // Valeur hors liste : on desactive la validation, on ecrit, on remet
+            cell.clearDataValidations();
+            cell.setValue(action.nouvelle);
+            cell.setDataValidation(validation);
+            action.statut       = "OK_HORS_LISTE";
+            action.avertissement = `Valeur "${action.nouvelle}" hors liste deroulante - ecrite quand meme`;
+            Logger.log(`HORS LISTE DDL : ${action.key} / ${action.champ} = "${action.nouvelle}"`);
+          }
+        } else {
+          cell.setValue(action.nouvelle);
+          action.statut = "OK";
+        }
+      } else {
+        cell.setValue(action.nouvelle);
+        action.statut = "OK";
+      }
+
+      // Surlignage selon statut
+      if (action.statut === "OK_HORS_LISTE") {
+        cell.setBackground("#FFE0B2"); // Orange si hors liste
+      } else {
+        cell.setBackground("#FFF59D"); // Jaune standard
+      }
+
+      let note = `Mis a jour par Discovery le ${dateMAJ}\nAncienne valeur : "${action.ancienne}"`;
+      if (action.avertissement) note += `\n ${action.avertissement}`;
+      cell.setNote(note);
+
+    } catch (e) {
+      action.statut = "ECHEC";
+      action.erreur = e.message;
+      cell.setBackground("#FFCDD2"); // Rouge si echec
+      cell.setNote(`Echec de mise a jour le ${dateMAJ}\nValeur tentee : "${action.nouvelle}"\nErreur : ${e.message}`);
+      Logger.log(`ECHEC ecriture : ${action.key} / ${action.champ} - ${e.message}`);
+    }
+
     Utilities.sleep(200);
   }
 
-  // Toast final
-  ss.toast(`${actions.length} champ(s) mis à jour avec succès.`, "✅ Synchronisation terminée", 5);
+  const ok        = actions.filter(a => a.statut === "OK").length;
+  const horsListe = actions.filter(a => a.statut === "OK_HORS_LISTE").length;
+  const echecs    = actions.filter(a => a.statut === "ECHEC").length;
+
+  let bilanMsg = `${ok} mise(s) a jour OK`;
+  if (horsListe > 0) bilanMsg += ` | ${horsListe} hors liste deroulante`;
+  if (echecs    > 0) bilanMsg += ` | ${echecs} echec(s)`;
+
+  ss.toast(bilanMsg, "Synchronisation terminee", 8);
 }
 
 // ============================================================
@@ -461,7 +521,12 @@ function _ecrireRapport(invSS, actions, applique) {
     a.nouvelle,
     a.invRowSheet,
     a.invColSheet,
-    applique ? "✅ Mis à jour" : "⏳ En attente",
+    (() => {
+          if (!applique) return "En attente";
+          if (a.statut === "ECHEC")         return "ECHEC - " + (a.erreur || "");
+          if (a.statut === "OK_HORS_LISTE") return "Hors liste DDL";
+          return "OK";
+        })(),
   ]);
 
   if (rows.length > 0) {
