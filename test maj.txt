@@ -401,92 +401,117 @@ function _executer(apercuSeulement) {
 function _appliquerModifications(invSheet, actions) {
   const ss      = invSheet.getParent();
   const dateMAJ = new Date().toLocaleString("fr-FR");
-  let count     = 0;
+
+  ss.toast("Lecture de l'inventaire...", "Synchronisation en cours", 10);
+
+  // ── 1. Lire toute la plage inventaire EN UNE FOIS en memoire ──────────────
+  const lastRow  = invSheet.getLastRow();
+  const lastCol  = invSheet.getLastColumn();
+  const plage    = invSheet.getRange(1, 1, lastRow, lastCol);
+  const valeurs  = plage.getValues();       // tableau 2D complet en memoire
+  const couleurs = plage.getBackgrounds();  // couleurs actuelles
+  const notes    = plage.getNotes();        // notes actuelles
+
+  // ── 2. Lire les validations des colonnes concernees (une par colonne unique) ─
+  ss.toast("Lecture des validations...", "Synchronisation en cours", 10);
+  const colsUniques = [...new Set(actions.map(a => a.invColSheet))];
+  const validationParCol = {};
+  for (const col of colsUniques) {
+    try {
+      // On lit la validation sur la ligne 2 (premiere ligne de donnees)
+      validationParCol[col] = invSheet.getRange(2, col).getDataValidation();
+    } catch(e) {
+      validationParCol[col] = null;
+    }
+  }
+
+  // ── 3. Calculer les valeurs finales et modifier le tableau en memoire ──────
+  ss.toast("Calcul des modifications...", "Synchronisation en cours", 5);
 
   for (const action of actions) {
-    count++;
-
-    ss.toast(
-      `[${count}/${actions.length}] "${action.champ}" -> "${action.nouvelle}"`,
-      `Mise a jour : ${action.key}`,
-      3
-    );
-
-    const cell = invSheet.getRange(action.invRowSheet, action.invColSheet);
+    const validation = validationParCol[action.invColSheet];
+    const rowIdx     = action.invRowSheet - 1; // 0-index pour le tableau
+    const colIdx     = action.invColSheet - 1;
 
     try {
-      const validation = cell.getDataValidation();
+      let valeurAEcrire = action.nouvelle;
+      action.horsListe  = false;
 
       if (validation) {
         const criteria = validation.getCriteriaType();
         const isDdl    = criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST
                       || criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_RANGE;
 
-        if (isDdl) {
-          let valeursAutorisees = [];
-          if (criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
-            valeursAutorisees = validation.getCriteriaValues()[0] || [];
-          }
-
-          const valeurNorm = String(action.nouvelle).trim();
-
-          // Chercher la valeur exacte dans la liste (insensible a la casse)
-          // On ecrit la valeur TELLE QU'ELLE EST DANS LA LISTE du menu deroulant
-          // ex: Discovery envoie "GUEST" -> on ecrit "guest" (la valeur du menu)
-          const valeurDansListe = valeursAutorisees.find(
+        if (isDdl && criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
+          const valeursAutorisees = validation.getCriteriaValues()[0] || [];
+          const valeurNorm        = String(action.nouvelle).trim();
+          const valeurDansListe   = valeursAutorisees.find(
             v => String(v).trim().toLowerCase() === valeurNorm.toLowerCase()
           );
-          const estAutorisee = valeursAutorisees.length === 0 || valeurDansListe !== undefined;
 
-          if (estAutorisee) {
-            const valeurAEcrire = valeurDansListe !== undefined ? String(valeurDansListe).trim() : valeurNorm;
-            cell.setValue(valeurAEcrire);
+          if (valeurDansListe !== undefined) {
+            valeurAEcrire = String(valeurDansListe).trim();
             if (valeurAEcrire !== action.nouvelle) {
-              // On trace la normalisation dans le rapport
               action.avertissement = `Casse normalisee : "${action.nouvelle}" -> "${valeurAEcrire}"`;
-              action.nouvelle = valeurAEcrire;
+              action.nouvelle      = valeurAEcrire;
             }
-            action.statut = "OK";
           } else {
-            // Valeur hors liste : on desactive la validation, on ecrit, on remet
-            cell.clearDataValidations();
-            cell.setValue(action.nouvelle);
-            cell.setDataValidation(validation);
-            action.statut       = "OK_HORS_LISTE";
+            // Hors liste : on ecrit quand meme
+            action.horsListe     = true;
             action.avertissement = `Valeur "${action.nouvelle}" hors liste deroulante - ecrite quand meme`;
-            Logger.log(`HORS LISTE DDL : ${action.key} / ${action.champ} = "${action.nouvelle}"`);
+            Logger.log(`HORS LISTE : ${action.key} / ${action.champ} = "${action.nouvelle}"`);
           }
-        } else {
-          cell.setValue(action.nouvelle);
-          action.statut = "OK";
         }
-      } else {
-        cell.setValue(action.nouvelle);
-        action.statut = "OK";
       }
 
-      // Surlignage selon statut
-      if (action.statut === "OK_HORS_LISTE") {
-        cell.setBackground("#FFE0B2"); // Orange si hors liste
-      } else {
-        cell.setBackground("#FFF59D"); // Jaune standard
-      }
+      // Modifier le tableau en memoire
+      valeurs[rowIdx][colIdx]  = valeurAEcrire;
+      action.valeurFinale      = valeurAEcrire;
+      action.statut            = action.horsListe ? "OK_HORS_LISTE" : "OK";
 
-      let note = `Mis a jour par Discovery le ${dateMAJ}\nAncienne valeur : "${action.ancienne}"`;
-      if (action.avertissement) note += `\n ${action.avertissement}`;
-      cell.setNote(note);
+      // Couleur dans le tableau memoire
+      couleurs[rowIdx][colIdx] = action.horsListe ? "#FFE0B2" : "#FFF59D";
 
-    } catch (e) {
-      action.statut = "ECHEC";
-      action.erreur = e.message;
-      cell.setBackground("#FFCDD2"); // Rouge si echec
-      cell.setNote(`Echec de mise a jour le ${dateMAJ}\nValeur tentee : "${action.nouvelle}"\nErreur : ${e.message}`);
-      Logger.log(`ECHEC ecriture : ${action.key} / ${action.champ} - ${e.message}`);
+      // Note dans le tableau memoire
+      let note = `Mis a jour par Discovery le ${dateMAJ}
+Ancienne valeur : "${action.ancienne}"`;
+      if (action.avertissement) note += `
+${action.avertissement}`;
+      notes[rowIdx][colIdx] = note;
+
+    } catch(e) {
+      action.statut       = "ECHEC";
+      action.erreur       = e.message;
+      action.valeurFinale = null;
+      couleurs[rowIdx][colIdx] = "#FFCDD2";
+      notes[rowIdx][colIdx]    = `Echec le ${dateMAJ} : ${e.message}`;
+      Logger.log(`ECHEC : ${action.key} / ${action.champ} - ${e.message}`);
     }
-
-    Utilities.sleep(200);
   }
 
+  // ── 4. Ecrire toute la plage EN UN SEUL APPEL API ─────────────────────────
+  ss.toast("Ecriture dans l'inventaire...", "Synchronisation en cours", 15);
+
+  // Pour les cellules hors liste : desactiver la validation sur ces colonnes le temps d'ecrire
+  const colsHorsListe = [...new Set(
+    actions.filter(a => a.horsListe).map(a => a.invColSheet)
+  )];
+  for (const col of colsHorsListe) {
+    invSheet.getRange(2, col, lastRow - 1, 1).clearDataValidations();
+  }
+
+  // Ecriture des valeurs, couleurs et notes en 3 appels globaux
+  plage.setValues(valeurs);
+  plage.setBackgrounds(couleurs);
+  plage.setNotes(notes);
+
+  // Remettre les validations sur les colonnes hors liste
+  for (const col of colsHorsListe) {
+    const validation = validationParCol[col];
+    if (validation) invSheet.getRange(2, col, lastRow - 1, 1).setDataValidation(validation);
+  }
+
+  // ── 5. Bilan ──────────────────────────────────────────────────────────────
   const ok        = actions.filter(a => a.statut === "OK").length;
   const horsListe = actions.filter(a => a.statut === "OK_HORS_LISTE").length;
   const echecs    = actions.filter(a => a.statut === "ECHEC").length;
@@ -497,6 +522,7 @@ function _appliquerModifications(invSheet, actions) {
 
   ss.toast(bilanMsg, "Synchronisation terminee", 8);
 }
+
 
 // ============================================================
 //  RÉSUMÉ TEXTE (pour boîte de dialogue)
