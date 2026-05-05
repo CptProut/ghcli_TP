@@ -2,9 +2,11 @@
 //  CONFIGURATION — À adapter à votre environnement
 // ============================================================
 const CONFIG = {
-  // IDs des fichiers Google Sheets
-  INVENTAIRE_SHEET_ID: "COLLER_ICI_L_ID_DE_L_INVENTAIRE",
-  EXTRACT_SHEET_ID:    "COLLER_ICI_L_ID_DU_FICHIER_EXTRACT",
+  // ⚠️ L'inventaire est le fichier dans lequel ce script est installé.
+  // Pas besoin d'ID — le script l'ouvre automatiquement via getActiveSpreadsheet().
+
+  // ID du fichier extract (optionnel ici, saisi à chaque lancement via le menu)
+  EXTRACT_SHEET_ID:    "",   // Laissez vide, il est demandé au lancement
 
   // Noms des onglets
   INVENTAIRE_TAB:  "Inventaire serveurs",  // Onglet de l'inventaire maître
@@ -229,7 +231,9 @@ function _executer(apercuSeulement) {
     const { extractId, extractTab } = extractInfo;
 
     // 1. Charger les données
-    const invSS    = SpreadsheetApp.openById(CONFIG.INVENTAIRE_SHEET_ID);
+    // Le script tourne dans l'inventaire -> on utilise getActiveSpreadsheet()
+    // plutot que openById() qui cause "Illegal spreadsheet" sur le fichier courant
+    const invSS    = SpreadsheetApp.getActiveSpreadsheet();
     const extSS    = SpreadsheetApp.openById(extractId);
     const invSheet = invSS.getSheetByName(CONFIG.INVENTAIRE_TAB);
     const extSheet = extSS.getSheetByName(extractTab);
@@ -592,7 +596,7 @@ function creerDeclencheurLundi() {
 function ouvrirRapport() {
   const ui = SpreadsheetApp.getUi();
   try {
-    const invSS = SpreadsheetApp.openById(CONFIG.INVENTAIRE_SHEET_ID);
+    const invSS = SpreadsheetApp.getActiveSpreadsheet();
     const r     = invSS.getSheetByName(CONFIG.RAPPORT_TAB);
     if (!r) {
       ui.alert("Aucun rapport", "Lancez d'abord une synchronisation ou un aperçu.", ui.ButtonSet.OK);
