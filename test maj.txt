@@ -284,22 +284,27 @@ function _executer(apercuSeulement) {
           continue;
         }
 
-        const discoveryVal = String(row[CONFIG.MAPPING[champ].col - 1] ?? "").trim();
-        if (!discoveryVal) continue; // pas de valeur discovery, rien à faire
+        let discoveryVal = String(row[CONFIG.MAPPING[champ].col - 1] ?? "").trim();
+        if (!discoveryVal) continue; // pas de valeur discovery, rien a faire
 
-        const invColIdx    = CONFIG.INVENTAIRE_COLS[champ] - 1;
-        const invActuelle  = String(invData[invRowIdx][invColIdx] ?? "").trim();
+        // Regle 1 : "DISCOVERED" (toutes variantes de casse) est remplace par 1
+        if (discoveryVal.toUpperCase() === "DISCOVERED") discoveryVal = "1";
 
-        if (discoveryVal !== invActuelle) {
-          actions.push({
-            key,
-            champ,
-            ancienne:  invActuelle,
-            nouvelle:  discoveryVal,
-            invRowSheet: invRowIdx + 1,    // ligne réelle dans la sheet (1-indexé)
-            invColSheet: CONFIG.INVENTAIRE_COLS[champ], // colonne réelle
-          });
-        }
+        const invColIdx   = CONFIG.INVENTAIRE_COLS[champ] - 1;
+        const invActuelle = String(invData[invRowIdx][invColIdx] ?? "").trim();
+
+        // Regle 2 : comparaison insensible a la casse
+        // Si les valeurs sont identiques en ignorant la casse -> pas d'ecart
+        if (discoveryVal.toLowerCase() === invActuelle.toLowerCase()) continue;
+
+        actions.push({
+          key,
+          champ,
+          ancienne:    invActuelle,
+          nouvelle:    discoveryVal,
+          invRowSheet: invRowIdx + 1,
+          invColSheet: CONFIG.INVENTAIRE_COLS[champ],
+        });
       }
     }
 
