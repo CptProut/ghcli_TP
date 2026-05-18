@@ -1,8 +1,25 @@
-{
-  "oauthScopes": [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/script.container.ui"
-  ]
+function testConnexionBMC() {
+  const url = CONFIG.BMC_BASE_URL + "/api/v1.2/about";
+  
+  try {
+    const response = UrlFetchApp.fetch(url, {
+      method: "GET",
+      headers: {
+        "Authorization": "Bearer " + CONFIG.BMC_TOKEN,
+        "Accept": "application/json"
+      },
+      muteHttpExceptions: true,
+      followRedirects: true,
+    });
+
+    const code = response.getResponseCode();
+    const body = response.getContentText().substring(0, 500);
+
+    Logger.log("✅ Serveur joignable !");
+    Logger.log("HTTP Code : " + code);
+    Logger.log("Réponse   : " + body);
+
+  } catch (e) {
+    Logger.log("❌ Erreur : " + e.message);
+  }
 }
