@@ -3,7 +3,7 @@
 #  BMC Discovery v1.14 — Export CSV des changements
 #  Gère la pagination, filtre par date côté local
 #  Usage : ./bmc_export.sh
-#  Prérequis : curl, python3  (brew install python3 si absent)
+#  Prérequis : curl, python3
 # ============================================================
 
 # ─────────────────────────────────────────────────────────────
@@ -38,7 +38,6 @@ SEUIL_DATE=$(python3 -c "import datetime; print(datetime.datetime.fromtimestamp(
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 OUTPUT_FILE="${OUTPUT_DIR}/bmc_changes_${TIMESTAMP}.csv"
 TMP_DIR=$(mktemp -d /tmp/bmc_XXXXXX)
-TMP_PAGES="${TMP_DIR}/pages.json"  # fichier JSON combiné de toutes les pages
 
 info "Connexion à BMC Discovery : ${BMC_URL}"
 info "Fenêtre temporelle        : ${JOURS} derniers jours (depuis ${SEUIL_DATE})"
@@ -48,16 +47,12 @@ echo ""
 # ── Requête TDL ───────────────────────────────────────────────
 TDL_QUERY="search Host show name, fqdn, os, os_version, ip_address, mac_address, cpu_count, ram, disk_total, serial_no, model, manufacturer, domain, virtual, _update_time, _change_time, _last_update_time"
 
-# ── Fonction appel API avec gestion code HTTP ─────────────────
+# ── Fonction appel API ────────────────────────────────────────
 fetch_page() {
   local offset=$1
-  local url="${BMC_URL}/api/v1.14/data/search"
-
-  # Encodage de la query + paramètres de pagination
   local encoded
   encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${TDL_QUERY}'))")
-
-  local full_url="${url}?query=${encoded}&offset=${offset}&results_id=&format=json"
+  local full_url="${BMC_URL}/api/v1.14/data/search?query=${encoded}&offset=${offset}"
 
   local response
   response=$(curl --silent --show-error --write-out "HTTPSTATUS:%{http_code}" \
@@ -74,6 +69,7 @@ fetch_page() {
 
   case "$code" in
     200) echo "$body" ;;
+    400) error "Requête invalide (400) : $(echo "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("message","?"))' 2>/dev/null || echo "$body")" ;;
     401) error "Authentification refusée (401). Vérifie ton BMC_TOKEN." ;;
     403) error "Accès interdit (403). Droits insuffisants." ;;
     404) error "Endpoint introuvable (404). Vérifie BMC_URL." ;;
@@ -81,22 +77,28 @@ fetch_page() {
   esac
 }
 
-# ── Récupération paginée ──────────────────────────────────────
-info "Récupération des hosts (pagination par ${PAGE_SIZE})..."
+# ── Première page → déterminer le total ───────────────────────
+info "Récupération de la première page..."
+fetch_page 0 > "${TMP_DIR}/page_0.json"
 
-# Première page pour connaître le total
-FIRST_PAGE=$(fetch_page 0)
-TOTAL=$(echo "$FIRST_PAGE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('count', 0))")
+# Parser proprement : si c'est une liste Python prend le premier élément
+TOTAL=$(python3 - <<PYEOF
+import json
+with open("${TMP_DIR}/page_0.json") as f:
+    raw = json.load(f)
+# L'API peut retourner un dict ou une liste contenant un dict
+d = raw[0] if isinstance(raw, list) else raw
+print(d.get("count", 0))
+PYEOF
+)
+
 info "Total hosts dans BMC : ${TOTAL}"
 
-# Écrire la première page dans le fichier combiné
-echo "$FIRST_PAGE" > "${TMP_DIR}/page_0.json"
-
-# Pages suivantes si nécessaire
+# ── Pages suivantes ───────────────────────────────────────────
 OFFSET=${PAGE_SIZE}
 PAGE=1
 while [ "$OFFSET" -lt "$TOTAL" ]; do
-  info "  Récupération page ${PAGE} (offset ${OFFSET})..."
+  info "  Page ${PAGE} (offset ${OFFSET} / ${TOTAL})..."
   fetch_page "$OFFSET" > "${TMP_DIR}/page_${PAGE}.json"
   OFFSET=$((OFFSET + PAGE_SIZE))
   PAGE=$((PAGE + 1))
@@ -104,30 +106,31 @@ done
 
 info "Toutes les pages récupérées. Traitement en cours..."
 
-# ── Traitement Python : fusion pages + filtrage date + CSV ────
+# ── Fusion + filtrage date + export CSV ──────────────────────
 python3 - <<PYEOF
-import json, csv, datetime, os, glob
+import json, csv, datetime, glob, os
 
 seuil_ts    = ${SEUIL_TS}
 output_file = "${OUTPUT_FILE}"
 tmp_dir     = "${TMP_DIR}"
-page_size   = ${PAGE_SIZE}
 
-# Charger toutes les pages
 all_results = []
 headings    = []
 
-page_files = sorted(glob.glob(f"{tmp_dir}/page_*.json"))
-for pf in page_files:
+for pf in sorted(glob.glob(f"{tmp_dir}/page_*.json")):
     with open(pf) as f:
-        data = json.load(f)
+        raw = json.load(f)
+
+    # Normalisation : liste ou dict
+    d = raw[0] if isinstance(raw, list) else raw
+
     if not headings:
-        headings = data.get("headings", [])
-    all_results.extend(data.get("results", []))
+        headings = d.get("headings", [])
+    all_results.extend(d.get("results", []))
 
 print(f"[INFO]  Total hosts chargés   : {len(all_results)}")
 
-# Index des colonnes de date
+# Index colonnes de date
 date_cols = [headings.index(n) for n in ["_update_time", "_change_time", "_last_update_time"] if n in headings]
 
 if not date_cols:
@@ -165,7 +168,6 @@ for row in all_results:
 print(f"[INFO]  Machines modifiées     : {len(filtered)}")
 print(f"[INFO]  Machines ignorées      : {skipped}")
 
-# Écriture CSV
 with open(output_file, "w", newline="", encoding="utf-8") as csvf:
     writer = csv.writer(csvf, quoting=csv.QUOTE_ALL)
     writer.writerow(headings)
@@ -183,7 +185,6 @@ PYEOF
 # ── Nettoyage ─────────────────────────────────────────────────
 rm -rf "$TMP_DIR"
 
-# ── Résumé ────────────────────────────────────────────────────
 echo ""
 info "✅ Export terminé !"
 info "   Fichier : ${OUTPUT_FILE}"
