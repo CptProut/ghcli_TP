@@ -1,14 +1,5 @@
 curl --insecure --silent \
   -H "Authorization: Bearer TON_TOKEN" \
   -H "Accept: application/json" \
-  "https://TON_INSTANCE_BMC/api/v1.14/data/search?query=search+Host+show+name+limit+1"
-
-
-
-
-
-curl --insecure -v \
-  -H "Authorization: Bearer TON_TOKEN" \
-  -H "Accept: application/json" \
-  "https://TON_INSTANCE_BMC/api/v1.2/about"
-open "$OUTPUT_DIR"
+  "https://TON_INSTANCE_BMC/api/v1.14/data/search?query=search+Host+show+name,os" \
+  | python3 -m json.tool | head -50
