@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================
 #  BMC Discovery v1.14 — Export CSV des changements
-#  Filtre les machines modifiées dans les N derniers jours
+#  Gère la pagination, filtre par date côté local
 #  Usage : ./bmc_export.sh
-#  Prérequis : curl, jq  (brew install jq si absent)
+#  Prérequis : curl, python3  (brew install python3 si absent)
 # ============================================================
 
 # ─────────────────────────────────────────────────────────────
@@ -13,6 +13,7 @@ BMC_URL="https://VOTRE_INSTANCE_BMC"   # sans slash final
 BMC_TOKEN="VOTRE_TOKEN_API"
 OUTPUT_DIR="$HOME/Desktop"             # dossier de sortie du CSV
 JOURS=7                                # fenêtre temporelle (jours)
+PAGE_SIZE=100                          # nb de résultats par page
 
 # ─────────────────────────────────────────────────────────────
 #  NE PAS MODIFIER EN DESSOUS
@@ -26,76 +27,111 @@ error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 # ── Vérification des dépendances ──────────────────────────────
 info "Vérification des dépendances..."
-command -v curl    &>/dev/null || error "curl non trouvé. Installe-le avec : brew install curl"
-command -v jq      &>/dev/null || error "jq non trouvé. Installe-le avec : brew install jq"
-command -v python3 &>/dev/null || error "python3 non trouvé. Installe-le avec : brew install python3"
+command -v curl    &>/dev/null || error "curl non trouvé : brew install curl"
+command -v python3 &>/dev/null || error "python3 non trouvé : brew install python3"
 
-# ── Calcul de la date seuil (timestamp Unix, N jours en arrière) ──
+# ── Calcul date seuil ─────────────────────────────────────────
 SEUIL_TS=$(python3 -c "import time; print(int(time.time()) - ${JOURS} * 86400)")
 SEUIL_DATE=$(python3 -c "import datetime; print(datetime.datetime.fromtimestamp(${SEUIL_TS}).strftime('%Y-%m-%d %H:%M:%S'))")
 
-# ── Nom du fichier de sortie ──────────────────────────────────
+# ── Fichiers de travail ───────────────────────────────────────
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 OUTPUT_FILE="${OUTPUT_DIR}/bmc_changes_${TIMESTAMP}.csv"
-TMP_FILE=$(mktemp /tmp/bmc_raw_XXXXXX.json)
+TMP_DIR=$(mktemp -d /tmp/bmc_XXXXXX)
+TMP_PAGES="${TMP_DIR}/pages.json"  # fichier JSON combiné de toutes les pages
 
 info "Connexion à BMC Discovery : ${BMC_URL}"
 info "Fenêtre temporelle        : ${JOURS} derniers jours (depuis ${SEUIL_DATE})"
 info "Fichier de sortie         : ${OUTPUT_FILE}"
 echo ""
 
-# ── Requête TDL (GET, encodage URL) ───────────────────────────
+# ── Requête TDL ───────────────────────────────────────────────
 TDL_QUERY="search Host show name, fqdn, os, os_version, ip_address, mac_address, cpu_count, ram, disk_total, serial_no, model, manufacturer, domain, virtual, _update_time, _change_time, _last_update_time"
 
-ENCODED_QUERY=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${TDL_QUERY}'))")
+# ── Fonction appel API avec gestion code HTTP ─────────────────
+fetch_page() {
+  local offset=$1
+  local url="${BMC_URL}/api/v1.14/data/search"
 
-info "Récupération de tous les hosts depuis BMC..."
+  # Encodage de la query + paramètres de pagination
+  local encoded
+  encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${TDL_QUERY}'))")
 
-HTTP_RESPONSE=$(curl --silent --show-error --write-out "HTTPSTATUS:%{http_code}" \
-  --max-time 120 \
-  --insecure \
-  -X GET \
-  "${BMC_URL}/api/v1.14/data/search?query=${ENCODED_QUERY}" \
-  -H "Authorization: Bearer ${BMC_TOKEN}" \
-  -H "Accept: application/json")
+  local full_url="${url}?query=${encoded}&offset=${offset}&results_id=&format=json"
 
-# Séparer body et code HTTP
-HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed -e 's/HTTPSTATUS:[0-9]*$//')
-HTTP_CODE=$(echo "$HTTP_RESPONSE" | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+  local response
+  response=$(curl --silent --show-error --write-out "HTTPSTATUS:%{http_code}" \
+    --max-time 120 \
+    --insecure \
+    -X GET \
+    "$full_url" \
+    -H "Authorization: Bearer ${BMC_TOKEN}" \
+    -H "Accept: application/json")
 
-# ── Vérification du code HTTP ─────────────────────────────────
-case "$HTTP_CODE" in
-  200) ;;
-  400) error "Requête invalide (400). Détail : $(echo "$HTTP_BODY" | jq -r '.message // .')" ;;
-  401) error "Authentification refusée (401). Vérifie ton BMC_TOKEN." ;;
-  403) error "Accès interdit (403). Droits insuffisants sur le token." ;;
-  404) error "Endpoint introuvable (404). Vérifie BMC_URL." ;;
-  *)   error "Erreur HTTP ${HTTP_CODE} : ${HTTP_BODY}" ;;
-esac
+  local body code
+  body=$(echo "$response" | sed -e 's/HTTPSTATUS:[0-9]*$//')
+  code=$(echo "$response" | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
 
-# Sauvegarder le JSON brut
-echo "$HTTP_BODY" > "$TMP_FILE"
+  case "$code" in
+    200) echo "$body" ;;
+    401) error "Authentification refusée (401). Vérifie ton BMC_TOKEN." ;;
+    403) error "Accès interdit (403). Droits insuffisants." ;;
+    404) error "Endpoint introuvable (404). Vérifie BMC_URL." ;;
+    *)   error "Erreur HTTP ${code} : ${body}" ;;
+  esac
+}
 
-NB_TOTAL=$(jq '.results // [] | length' "$TMP_FILE")
-info "Hosts récupérés depuis BMC : ${NB_TOTAL}"
+# ── Récupération paginée ──────────────────────────────────────
+info "Récupération des hosts (pagination par ${PAGE_SIZE})..."
 
-# ── Filtrage par date côté bash via python3 ───────────────────
-info "Filtrage des machines modifiées depuis ${SEUIL_DATE}..."
+# Première page pour connaître le total
+FIRST_PAGE=$(fetch_page 0)
+TOTAL=$(echo "$FIRST_PAGE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('count', 0))")
+info "Total hosts dans BMC : ${TOTAL}"
 
+# Écrire la première page dans le fichier combiné
+echo "$FIRST_PAGE" > "${TMP_DIR}/page_0.json"
+
+# Pages suivantes si nécessaire
+OFFSET=${PAGE_SIZE}
+PAGE=1
+while [ "$OFFSET" -lt "$TOTAL" ]; do
+  info "  Récupération page ${PAGE} (offset ${OFFSET})..."
+  fetch_page "$OFFSET" > "${TMP_DIR}/page_${PAGE}.json"
+  OFFSET=$((OFFSET + PAGE_SIZE))
+  PAGE=$((PAGE + 1))
+done
+
+info "Toutes les pages récupérées. Traitement en cours..."
+
+# ── Traitement Python : fusion pages + filtrage date + CSV ────
 python3 - <<PYEOF
-import json, csv, datetime
+import json, csv, datetime, os, glob
 
-seuil_ts  = ${SEUIL_TS}
+seuil_ts    = ${SEUIL_TS}
 output_file = "${OUTPUT_FILE}"
+tmp_dir     = "${TMP_DIR}"
+page_size   = ${PAGE_SIZE}
 
-with open("${TMP_FILE}") as f:
-    data = json.load(f)
+# Charger toutes les pages
+all_results = []
+headings    = []
 
-headings  = data.get("headings", [])
-results   = data.get("results", [])
+page_files = sorted(glob.glob(f"{tmp_dir}/page_*.json"))
+for pf in page_files:
+    with open(pf) as f:
+        data = json.load(f)
+    if not headings:
+        headings = data.get("headings", [])
+    all_results.extend(data.get("results", []))
 
-# Index des colonnes de date disponibles
+print(f"[INFO]  Total hosts chargés   : {len(all_results)}")
+
+# Index des colonnes de date
 date_cols = [headings.index(n) for n in ["_update_time", "_change_time", "_last_update_time"] if n in headings]
+
+if not date_cols:
+    print("[WARN]  Aucune colonne de date trouvée — export de tous les hosts")
 
 def parse_bmc_date(val):
     if val is None or val == "":
@@ -113,8 +149,8 @@ def parse_bmc_date(val):
 
 filtered, skipped = [], 0
 
-for row in results:
-    keep = not date_cols  # si aucune colonne date, on garde tout
+for row in all_results:
+    keep = not date_cols
     for idx in date_cols:
         val = row[idx] if idx < len(row) else None
         ts  = parse_bmc_date(val)
@@ -126,34 +162,30 @@ for row in results:
     else:
         skipped += 1
 
-print(f"[INFO]  Machines dans la fenêtre temporelle : {len(filtered)}")
-print(f"[INFO]  Machines ignorées (trop anciennes)  : {skipped}")
+print(f"[INFO]  Machines modifiées     : {len(filtered)}")
+print(f"[INFO]  Machines ignorées      : {skipped}")
 
+# Écriture CSV
 with open(output_file, "w", newline="", encoding="utf-8") as csvf:
     writer = csv.writer(csvf, quoting=csv.QUOTE_ALL)
     writer.writerow(headings)
     for row in filtered:
-        cleaned = []
-        for cell in row:
-            if cell is None:
-                cleaned.append("")
-            elif isinstance(cell, bool):
-                cleaned.append("true" if cell else "false")
-            else:
-                cleaned.append(str(cell))
-        writer.writerow(cleaned)
+        writer.writerow([
+            "" if cell is None
+            else ("true" if cell else "false") if isinstance(cell, bool)
+            else str(cell)
+            for cell in row
+        ])
 
 print(f"[INFO]  CSV généré : {output_file}")
 PYEOF
 
-# ── Nettoyage fichier temporaire ──────────────────────────────
-rm -f "$TMP_FILE"
+# ── Nettoyage ─────────────────────────────────────────────────
+rm -rf "$TMP_DIR"
 
-# ── Résumé final ──────────────────────────────────────────────
+# ── Résumé ────────────────────────────────────────────────────
 echo ""
-info "✅ Export terminé avec succès !"
+info "✅ Export terminé !"
 info "   Fichier : ${OUTPUT_FILE}"
 echo ""
-
-# Ouvrir le dossier dans le Finder
 open "$OUTPUT_DIR"
