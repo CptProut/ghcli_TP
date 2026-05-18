@@ -4,22 +4,16 @@ function testConnexionBMC() {
   try {
     const response = UrlFetchApp.fetch(url, {
       method: "GET",
-      headers: {
-        "Authorization": "Bearer " + CONFIG.BMC_TOKEN,
-        "Accept": "application/json"
-      },
       muteHttpExceptions: true,
       followRedirects: true,
+      // Pas de token → on teste juste si le serveur répond
     });
 
     const code = response.getResponseCode();
-    const body = response.getContentText().substring(0, 500);
-
-    Logger.log("✅ Serveur joignable !");
-    Logger.log("HTTP Code : " + code);
-    Logger.log("Réponse   : " + body);
+    Logger.log("✅ Serveur joignable ! HTTP : " + code);
+    Logger.log(response.getContentText().substring(0, 300));
 
   } catch (e) {
-    Logger.log("❌ Erreur : " + e.message);
+    Logger.log("❌ " + e.message);
   }
 }
