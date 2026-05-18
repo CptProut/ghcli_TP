@@ -42,18 +42,19 @@ info "Fenêtre temporelle        : ${JOURS} derniers jours"
 info "Fichier de sortie         : ${OUTPUT_FILE}"
 echo ""
 
-# ── Appel API BMC ─────────────────────────────────────────────
+# ── Appel API BMC (GET avec query parameter) ──────────────────
 info "Envoi de la requête TDL..."
+
+# Encodage URL de la requête
+ENCODED_QUERY=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''${TDL_QUERY}'''))")
 
 HTTP_RESPONSE=$(curl --silent --show-error --write-out "HTTPSTATUS:%{http_code}" \
   --max-time 60 \
   --insecure \
-  -X POST \
-  "${BMC_URL}/api/v1.2/data/search" \
+  -X GET \
+  "${BMC_URL}/api/v1.2/data/search?query=${ENCODED_QUERY}" \
   -H "Authorization: Bearer ${BMC_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json" \
-  -d "{\"query\": \"${TDL_QUERY}\"}")
+  -H "Accept: application/json")
 
 # Séparer le body du code HTTP
 HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed -e 's/HTTPSTATUS:[0-9]*$//')
