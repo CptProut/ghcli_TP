@@ -277,7 +277,17 @@ function _executer(apercuSeulement) {
         const nomDiscovery  = String(row[CONFIG.MAPPING["Nom"].col - 1] ?? "").trim();
         const nomInventaire = String(row[CONFIG.EXTRACT_NOM_COL - 1]).trim();
         const nomMachine    = nomDiscovery || nomInventaire || key;
-        nonTrouves.push({ key, nom: nomMachine });
+
+        // Collecter toutes les valeurs discovery des champs du MAPPING pour le rapport
+        const valeursDiscovery = {};
+        for (const [champ, def] of Object.entries(CONFIG.MAPPING)) {
+          const val = String(row[def.col - 1] ?? "").trim();
+          const norm = val.toUpperCase();
+          const VALEURS_IGNOREES = ["N/A", "NA", "#N/A", "-", "--", "NONE", "NULL", "UNKNOWN", "N.A.", "N.A"];
+          valeursDiscovery[champ] = VALEURS_IGNOREES.includes(norm) ? "" : val;
+        }
+
+        nonTrouves.push({ key, nom: nomMachine, valeursDiscovery });
         Logger.log(`CAS 5 : "${key}" — nom="${nomMachine}" (discovery="${nomDiscovery}", inventaire="${nomInventaire}")`);
         continue;
       }
@@ -672,20 +682,34 @@ function _ecrireRapport(invSS, actions, applique, nonTrouves) {
   // Section machines Cas 5 (non trouvées dans l'inventaire)
   if (nonTrouves && nonTrouves.length > 0) {
     let lastRow = sheet.getLastRow() + 2;
-    sheet.getRange(lastRow, 1, 1, 3)
-      .setValues([["🆕 Cas 5 — Machines absentes de l'inventaire (à créer manuellement)", "", ""]])
+
+    // Titre de la section
+    const nbColsCas5 = Object.keys(CONFIG.MAPPING).length + 2; // Nom + Clé + champs MAPPING
+    sheet.getRange(lastRow, 1, 1, nbColsCas5)
+      .setValues([["🆕 Cas 5 — Machines absentes de l'inventaire (à créer manuellement)" + " ".repeat(nbColsCas5)]])
       .setFontWeight("bold").setBackground("#FFCDD2");
-    sheet.getRange(lastRow, 1, 1, 3).merge();
+    sheet.getRange(lastRow, 1, 1, nbColsCas5).merge();
     lastRow++;
-    // En-têtes
-    sheet.getRange(lastRow, 1, 1, 2).setValues([["Nom machine", "Clé Discovery"]])
+
+    // En-têtes : Nom machine + Clé Discovery + un colonne par champ du MAPPING
+    const champsCas5  = Object.keys(CONFIG.MAPPING);
+    const headersCas5 = ["Nom machine", "Clé Discovery", ...champsCas5];
+    sheet.getRange(lastRow, 1, 1, headersCas5.length)
+      .setValues([headersCas5])
       .setFontWeight("bold").setBackground("#FFEBEE");
     lastRow++;
+
+    // Une ligne par machine, avec les valeurs discovery issues de l'extract stockées dans nonTrouves
     nonTrouves.forEach(m => {
-      sheet.getRange(lastRow, 1).setValue(m.nom);
-      sheet.getRange(lastRow, 2).setValue(m.key);
+      const ligne = [m.nom, m.key];
+      for (const champ of champsCas5) {
+        ligne.push(m.valeursDiscovery ? (m.valeursDiscovery[champ] || "") : "");
+      }
+      sheet.getRange(lastRow, 1, 1, ligne.length).setValues([ligne]);
       lastRow++;
     });
+
+    sheet.autoResizeColumns(1, headersCas5.length);
   }
 
   sheet.autoResizeColumns(1, headers.length + 2);
@@ -753,29 +777,17 @@ function _envoyerGoogleChatCard(actions) {
             collapsible: false,
             widgets: [
               {
-                columns: {
-                  columnItems: [
-                    {
-                      horizontalSizeStyle: "FILL_AVAILABLE_SPACE",
-                      widgets: [{
-                        decoratedText: {
-                          topLabel: "Serveurs impactés",
-                          text: String(nbServeurs),
-                          startIcon: { knownIcon: "COMPUTER" },
-                        }
-                      }]
-                    },
-                    {
-                      horizontalSizeStyle: "FILL_AVAILABLE_SPACE",
-                      widgets: [{
-                        decoratedText: {
-                          topLabel: "Champs mis à jour",
-                          text: String(actions.length),
-                          startIcon: { knownIcon: "EDIT" },
-                        }
-                      }]
-                    }
-                  ]
+                decoratedText: {
+                  topLabel: "Serveurs impactés",
+                  text: String(nbServeurs),
+                  startIcon: { knownIcon: "COMPUTER" },
+                }
+              },
+              {
+                decoratedText: {
+                  topLabel: "Champs mis à jour",
+                  text: String(actions.length),
+                  startIcon: { knownIcon: "EDIT" },
                 }
               }
             ]
