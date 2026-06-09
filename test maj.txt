@@ -329,11 +329,12 @@ function _executer(apercuSeulement) {
 
         let discoveryVal = String(row[CONFIG.MAPPING[champ].col - 1] ?? "").trim();
 
-        // Sécurité anti-écrasement : si la valeur discovery est vide ou N/A,
-        // on ne touche pas une donnée cohérente de l'inventaire
+        // Sécurité anti-écrasement : valeur vide ou non significative → on ne touche rien
         if (!discoveryVal) continue;
-        const discoveryNorm = discoveryVal.toUpperCase();
-        if (discoveryNorm === "N/A" || discoveryNorm === "NA" || discoveryNorm === "-") {
+        const discoveryNorm = discoveryVal.toUpperCase().trim();
+        // Toutes les variantes de N/A : "N/A", "NA", "#N/A" (erreur Sheets), "-", "--", "NONE", "NULL", "UNKNOWN"
+        const VALEURS_IGNOREES = ["N/A", "NA", "#N/A", "-", "--", "NONE", "NULL", "UNKNOWN", "N.A.", "N.A"];
+        if (VALEURS_IGNOREES.includes(discoveryNorm)) {
           Logger.log(`SKIP N/A : ${key} / ${champ} — valeur discovery "${discoveryVal}" ignorée`);
           continue;
         }
@@ -525,11 +526,11 @@ ${action.avertissement}`;
   // ── 4. Ecrire toute la plage EN UN SEUL APPEL API ─────────────────────────
   ss.toast("Ecriture dans l'inventaire...", "Synchronisation en cours", 15);
 
-  // Pour les cellules hors liste : desactiver la validation sur ces colonnes le temps d'ecrire
-  const colsHorsListe = [...new Set(
-    actions.filter(a => a.horsListe).map(a => a.invColSheet)
-  )];
-  for (const col of colsHorsListe) {
+  // Désactiver la validation sur TOUTES les colonnes modifiées avant setValues.
+  // Sans ça, Google Sheets rejette les valeurs dont la casse diffère de la liste,
+  // même quand on a normalisé la casse en mémoire.
+  const colsModifiees = [...new Set(actions.map(a => a.invColSheet))];
+  for (const col of colsModifiees) {
     invSheet.getRange(2, col, lastRow - 1, 1).clearDataValidations();
   }
 
@@ -538,8 +539,9 @@ ${action.avertissement}`;
   plage.setBackgrounds(couleurs);
   plage.setNotes(notes);
 
-  // Remettre les validations sur les colonnes hors liste
-  for (const col of colsHorsListe) {
+  // Remettre les validations sur toutes les colonnes modifiées
+  // (y compris hors liste — la validation est restaurée, la valeur écrite reste)
+  for (const col of colsModifiees) {
     const validation = validationParCol[col];
     if (validation) invSheet.getRange(2, col, lastRow - 1, 1).setDataValidation(validation);
   }
