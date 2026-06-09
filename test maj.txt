@@ -273,9 +273,12 @@ function _executer(apercuSeulement) {
       // Cas 5 : absent de l'inventaire, présent dans discovery
       // → on collecte le nom de la machine pour la popup, on ne touche rien
       if (cas === 5) {
-        const nomMachine = String(row[CONFIG.EXTRACT_NOM_COL - 1]).trim() || key;
+        // Priorité : col 4 (nom discovery) > col 3 (nom inventaire, souvent vide en cas 5) > key
+        const nomDiscovery  = String(row[CONFIG.MAPPING["Nom"].col - 1] ?? "").trim();
+        const nomInventaire = String(row[CONFIG.EXTRACT_NOM_COL - 1]).trim();
+        const nomMachine    = nomDiscovery || nomInventaire || key;
         nonTrouves.push({ key, nom: nomMachine });
-        Logger.log(`CAS 5 : "${key}" (${nomMachine}) absent de l'inventaire — à créer manuellement`);
+        Logger.log(`CAS 5 : "${key}" — nom="${nomMachine}" (discovery="${nomDiscovery}", inventaire="${nomInventaire}")`);
         continue;
       }
 
@@ -344,8 +347,14 @@ function _executer(apercuSeulement) {
         // Regle 2 : comparaison insensible a la casse
         if (discoveryVal.toLowerCase() === invActuelle.toLowerCase()) continue;
 
+        // Nom lisible de la machine : col 4 (discovery) > col 3 (inventaire) > key
+        const nomDisc = String(row[CONFIG.MAPPING["Nom"].col - 1] ?? "").trim();
+        const nomInv  = String(row[CONFIG.EXTRACT_NOM_COL - 1]).trim();
+        const nomMach = nomDisc || nomInv || key;
+
         actions.push({
           key,
+          nom:         nomMach,
           cas,
           champ,
           ancienne:    invActuelle,
@@ -552,11 +561,11 @@ ${action.avertissement}`;
 //  RÉSUMÉ TEXTE (pour boîte de dialogue)
 // ============================================================
 function _genererResume(actions) {
-  // Grouper par clé
+  // Grouper par clé, conserver le nom lisible
   const parCle = {};
   for (const a of actions) {
-    if (!parCle[a.key]) parCle[a.key] = [];
-    parCle[a.key].push(a);
+    if (!parCle[a.key]) parCle[a.key] = { nom: a.nom || a.key, items: [] };
+    parCle[a.key].items.push(a);
   }
 
   const nbCles = Object.keys(parCle).length;
@@ -564,9 +573,9 @@ function _genererResume(actions) {
   msg += "─".repeat(45) + "\n";
 
   let shown = 0;
-  for (const [key, items] of Object.entries(parCle)) {
+  for (const [key, { nom, items }] of Object.entries(parCle)) {
     if (shown >= 10) { msg += `\n... et ${nbCles - shown} autre(s) serveur(s)`; break; }
-    msg += `\n🖥️ ${key} (${items.length} champ(s))\n`;
+    msg += `\n🖥️ ${nom} (${items.length} champ(s))\n`;
     for (const item of items.slice(0, 4)) {
       msg += `   • ${item.champ}: "${item.ancienne}" → "${item.nouvelle}"\n`;
     }
@@ -615,7 +624,7 @@ function _ecrireRapport(invSS, actions, applique, nonTrouves) {
   sheet.getRange("A6:B6").setValues([["Date de traitement", now.toLocaleDateString("fr-FR")]]);
 
   // ── En-têtes du détail ──
-  const headers = ["Identifiant", "Champ modifié", "Ancienne valeur (Inventaire)", "Nouvelle valeur (Discovery)", "Correspondance", "Statut"];
+  const headers = ["Nom machine", "Identifiant", "Champ modifié", "Ancienne valeur (Inventaire)", "Nouvelle valeur (Discovery)", "Correspondance", "Statut"];
   const hRow = 9;
   sheet.getRange(hRow, 1, 1, headers.length).setValues([headers])
     .setFontWeight("bold").setBackground("#E8F0FE")
@@ -623,6 +632,7 @@ function _ecrireRapport(invSS, actions, applique, nonTrouves) {
 
   // ── Données ──
   const rows = actions.map(a => [
+    a.nom || a.key,
     a.key,
     a.champ,
     a.ancienne,
