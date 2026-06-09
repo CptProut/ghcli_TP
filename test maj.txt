@@ -21,8 +21,8 @@ const CONFIG = {
   EXTRACT_KEY_COL: 1,      // Colonne "ID"
   EXTRACT_NOM_COL: 3,      // Colonne "Nom inventaire" (fallback pour nouvelles machines)
 
-  // Email(s) de notification (séparés par des virgules)
-  NOTIFICATION_EMAILS: "votre@email.com",
+  // Webhook Google Chat (espace de discussion cible)
+  GOOGLE_CHAT_WEBHOOK: "https://chat.googleapis.com/v1/spaces/XXXXXXX/messages?key=XXXXXX&token=XXXXXX",
 
   // Onglet rapport (sera créé/écrasé dans l'inventaire)
   RAPPORT_TAB: "Rapport_Sync",
@@ -380,12 +380,12 @@ function _executer(apercuSeulement) {
     // 7. Générer le rapport
     _ecrireRapport(invSS, actions, true, nonTrouves);
 
-    // 8. Envoyer email de notification
-    _envoyerEmail(actions);
+    // 8. Envoyer la carte Google Chat
+    _envoyerGoogleChatCard(actions);
 
     ui.alert(
       "✅ Synchronisation terminée",
-      `${actions.length} champ(s) mis à jour dans l'inventaire.\n\nUn rapport complet a été généré dans l'onglet "${CONFIG.RAPPORT_TAB}".\nUn email de synthèse a été envoyé à ${CONFIG.NOTIFICATION_EMAILS}.`,
+      `${actions.length} champ(s) mis à jour dans l'inventaire.\n\nUn rapport complet a été généré dans l'onglet "${CONFIG.RAPPORT_TAB}".\nUne notification a été envoyée sur Google Chat.`,
       ui.ButtonSet.OK
     );
 
@@ -653,11 +653,11 @@ function _ecrireRapport(invSS, actions, applique, nonTrouves) {
 }
 
 // ============================================================
-//  EMAIL DE NOTIFICATION
+//  NOTIFICATION GOOGLE CHAT — CARD V2
 // ============================================================
-function _envoyerEmail(actions) {
-  const now    = new Date();
-  const parCle = {};
+function _envoyerGoogleChatCard(actions) {
+  const now      = new Date();
+  const parCle   = {};
   const parChamp = {};
 
   for (const a of actions) {
@@ -666,91 +666,128 @@ function _envoyerEmail(actions) {
     parChamp[a.champ] = (parChamp[a.champ] || 0) + 1;
   }
 
-  // ── Corps HTML ──
-  let tableRows = "";
-  for (const a of actions) {
-    tableRows += `
-      <tr>
-        <td style="padding:6px 10px;border:1px solid #ddd;">${a.key}</td>
-        <td style="padding:6px 10px;border:1px solid #ddd;">${a.champ}</td>
-        <td style="padding:6px 10px;border:1px solid #ddd;color:#c62828;">${a.ancienne || "(vide)"}</td>
-        <td style="padding:6px 10px;border:1px solid #ddd;color:#2e7d32;">${a.nouvelle}</td>
-      </tr>`;
+  const nbServeurs = Object.keys(parCle).length;
+
+  // ── Widgets de répartition par champ ──
+  const champWidgets = Object.entries(parChamp)
+    .sort((a, b) => b[1] - a[1])
+    .map(([champ, nb]) => ({
+      decoratedText: {
+        topLabel: champ,
+        text: `${nb} mise(s) à jour`,
+        startIcon: { knownIcon: "BOOKMARK" },
+      }
+    }));
+
+  // ── Widgets de détail des modifications (max 15 pour ne pas dépasser la taille) ──
+  const detailWidgets = actions.slice(0, 15).map(a => ({
+    decoratedText: {
+      topLabel: `${a.key} — ${a.champ}`,
+      text: `<font color="#c62828">${a.ancienne || "(vide)"}</font>  →  <font color="#2e7d32">${a.nouvelle}</font>`,
+    }
+  }));
+
+  if (actions.length > 15) {
+    detailWidgets.push({
+      textParagraph: {
+        text: `<i>... et ${actions.length - 15} autre(s) modification(s). Consultez le rapport dans l'onglet "${CONFIG.RAPPORT_TAB}".</i>`
+      }
+    });
   }
 
-  let champStats = Object.entries(parChamp)
-    .sort((a, b) => b[1] - a[1])
-    .map(([c, n]) => `<li><b>${c}</b> : ${n} mise(s) à jour</li>`)
-    .join("");
+  // ── Construction de la Card v2 ──
+  const card = {
+    cardsV2: [{
+      cardId: "sync-rapport",
+      card: {
+        header: {
+          title: "🔄 Sync Discovery → Inventaire",
+          subtitle: now.toLocaleString("fr-FR"),
+          imageUrl: "https://fonts.gstatic.com/s/i/googlematerialicons/sync/v6/googlematerialicons-sync-48dp.png",
+          imageType: "CIRCLE",
+        },
+        sections: [
+          {
+            header: "📊 Résumé",
+            collapsible: false,
+            widgets: [
+              {
+                columns: {
+                  columnItems: [
+                    {
+                      horizontalSizeStyle: "FILL_AVAILABLE_SPACE",
+                      widgets: [{
+                        decoratedText: {
+                          topLabel: "Serveurs impactés",
+                          text: String(nbServeurs),
+                          startIcon: { knownIcon: "COMPUTER" },
+                        }
+                      }]
+                    },
+                    {
+                      horizontalSizeStyle: "FILL_AVAILABLE_SPACE",
+                      widgets: [{
+                        decoratedText: {
+                          topLabel: "Champs mis à jour",
+                          text: String(actions.length),
+                          startIcon: { knownIcon: "EDIT" },
+                        }
+                      }]
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            header: "📈 Répartition par champ",
+            collapsible: true,
+            uncollapsibleWidgetsCount: 3,
+            widgets: champWidgets,
+          },
+          {
+            header: "📋 Détail des modifications",
+            collapsible: true,
+            uncollapsibleWidgetsCount: 3,
+            widgets: detailWidgets,
+          },
+          {
+            widgets: [{
+              buttonList: {
+                buttons: [{
+                  text: "Ouvrir l'inventaire",
+                  icon: { knownIcon: "OPEN_IN_NEW" },
+                  onClick: {
+                    openLink: {
+                      url: SpreadsheetApp.getActiveSpreadsheet().getUrl(),
+                    }
+                  }
+                }]
+              }
+            }]
+          }
+        ]
+      }
+    }]
+  };
 
-  const html = `
-  <div style="font-family:Arial,sans-serif;max-width:900px;">
-    <div style="background:#1a73e8;color:white;padding:16px 24px;border-radius:8px 8px 0 0;">
-      <h2 style="margin:0;">🔄 Rapport de synchronisation Discovery → Inventaire</h2>
-      <p style="margin:4px 0 0;">${now.toLocaleString("fr-FR")}</p>
-    </div>
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(card),
+    muteHttpExceptions: true,
+  };
 
-    <div style="background:#f8f9fa;padding:16px 24px;border:1px solid #e0e0e0;">
-      <h3 style="color:#1a73e8;">📊 Résumé</h3>
-      <ul>
-        <li><b>${Object.keys(parCle).length}</b> serveur(s) impacté(s)</li>
-        <li><b>${actions.length}</b> champ(s) mis à jour</li>
-      </ul>
-      <h3 style="color:#1a73e8;">📈 Répartition par champ</h3>
-      <ul>${champStats}</ul>
-    </div>
+  const response = UrlFetchApp.fetch(CONFIG.GOOGLE_CHAT_WEBHOOK, options);
+  const code     = response.getResponseCode();
 
-    <div style="padding:16px 24px;border:1px solid #e0e0e0;border-top:none;">
-      <h3 style="color:#1a73e8;">📋 Détail des modifications</h3>
-      <table style="width:100%;border-collapse:collapse;font-size:13px;">
-        <thead>
-          <tr style="background:#e8f0fe;">
-            <th style="padding:8px 10px;border:1px solid #ddd;text-align:left;">Identifiant</th>
-            <th style="padding:8px 10px;border:1px solid #ddd;text-align:left;">Champ</th>
-            <th style="padding:8px 10px;border:1px solid #ddd;text-align:left;">Ancienne valeur</th>
-            <th style="padding:8px 10px;border:1px solid #ddd;text-align:left;">Nouvelle valeur (Discovery)</th>
-          </tr>
-        </thead>
-        <tbody>${tableRows}</tbody>
-      </table>
-    </div>
-
-    <div style="background:#f1f3f4;padding:12px 24px;border-radius:0 0 8px 8px;font-size:12px;color:#666;">
-      Synchronisation automatique — Inventaire IT | Script Apps Script
-    </div>
-  </div>`;
-
-  MailApp.sendEmail({
-    to:      CONFIG.NOTIFICATION_EMAILS,
-    subject: `[Inventaire IT] Sync Discovery — ${actions.length} mise(s) à jour — ${now.toLocaleDateString("fr-FR")}`,
-    htmlBody: html,
-  });
-
-  Logger.log("Email envoyé à : " + CONFIG.NOTIFICATION_EMAILS);
+  if (code !== 200) {
+    Logger.log(`⚠️ Google Chat webhook — réponse HTTP ${code} : ${response.getContentText()}`);
+  } else {
+    Logger.log("Notification Google Chat envoyée avec succès.");
+  }
 }
 
-// ============================================================
-//  DÉCLENCHEUR AUTOMATIQUE CHAQUE LUNDI
-// ============================================================
-function creerDeclencheurLundi() {
-  // Supprime les anciens déclencheurs pour éviter les doublons
-  ScriptApp.getProjectTriggers().forEach(t => {
-    if (t.getHandlerFunction() === "lancerSync") ScriptApp.deleteTrigger(t);
-  });
-
-  // Crée un déclencheur chaque lundi entre 8h et 9h
-  ScriptApp.newTrigger("lancerSync")
-    .timeBased()
-    .onWeekDay(ScriptApp.WeekDay.MONDAY)
-    .atHour(8)
-    .create();
-
-  SpreadsheetApp.getUi().alert(
-    "✅ Déclencheur créé",
-    "La synchronisation se lancera automatiquement chaque lundi entre 8h et 9h.",
-    SpreadsheetApp.getUi().ButtonSet.OK
-  );
-}
 
 // ============================================================
 //  OUVRIR RAPPORT
@@ -775,15 +812,16 @@ function afficherAide() {
   SpreadsheetApp.getUi().alert("⚙️ Configuration", `
 1. Ouvrez Extensions > Apps Script dans l'inventaire
 2. Collez ce script et configurez la section CONFIG :
-   - INVENTAIRE_SHEET_ID  → ID de l'inventaire (dans l'URL)
-   - EXTRACT_SHEET_ID     → ID du fichier extract hebdo
    - INVENTAIRE_TAB       → Nom de l'onglet inventaire
    - EXTRACT_TAB          → Nom de l'onglet extract
-   - NOTIFICATION_EMAILS  → Email(s) pour les rapports
+   - GOOGLE_CHAT_WEBHOOK  → URL du webhook de votre espace Google Chat
 3. Sauvegardez et rechargez la sheet
-4. Lancez "Créer le déclencheur lundi" pour l'automatisation
+4. Utilisez le menu "🔄 Sync Inventaire" pour lancer manuellement
 
-📌 L'ID se trouve dans l'URL :
+📌 L'ID d'un fichier se trouve dans l'URL :
    docs.google.com/spreadsheets/d/[ID]/edit
+
+📌 Pour créer un webhook Google Chat :
+   Espace → Paramètres → Applications et intégrations → Webhooks entrants
   `, SpreadsheetApp.getUi().ButtonSet.OK);
 }
