@@ -723,7 +723,7 @@ function _envoyerGoogleChatCard(actions) {
   // ── Widgets de détail des modifications (max 15 pour ne pas dépasser la taille) ──
   const detailWidgets = actions.slice(0, 15).map(a => ({
     decoratedText: {
-      topLabel: `${a.key} — ${a.champ}`,
+      topLabel: `${a.nom || a.key} — ${a.champ}`,
       text: `<font color="#c62828">${a.ancienne || "(vide)"}</font>  →  <font color="#2e7d32">${a.nouvelle}</font>`,
     }
   }));
