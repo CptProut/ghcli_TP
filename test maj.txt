@@ -19,6 +19,7 @@ const CONFIG = {
 
   // Colonnes dans l'EXTRACT
   EXTRACT_KEY_COL: 1,      // Colonne "ID"
+  EXTRACT_CAS_COL: 2,      // Colonne "CAS" (1 à 5) — détermine le type de réconciliation
   EXTRACT_NOM_COL: 3,      // Colonne "Nom inventaire" (fallback pour nouvelles machines)
 
   // Webhook Google Chat (espace de discussion cible)
@@ -259,24 +260,40 @@ function _executer(apercuSeulement) {
 
     // 3. Parcourir l'extract et identifier les ecarts
     const actions        = [];
-    const nonTrouves     = []; // lignes sans correspondance dans l'inventaire
+    const nonTrouves     = []; // Cas 5 : absent inventaire, présent discovery
 
     for (let e = 1; e < extData.length; e++) {
       const row = extData[e];
       const key = String(row[CONFIG.EXTRACT_KEY_COL - 1]).trim();
       if (!key) continue;
 
-      let invRowIdx   = undefined;
-      let modeMatch   = "";
+      // ── Lecture du CAS de réconciliation ──
+      const cas = parseInt(String(row[CONFIG.EXTRACT_CAS_COL - 1]).trim(), 10);
 
-      // Cas 1 : clé est un vrai identifiant INV- et existe dans l'inventaire
+      // Cas 5 : absent de l'inventaire, présent dans discovery
+      // → on collecte le nom de la machine pour la popup, on ne touche rien
+      if (cas === 5) {
+        const nomMachine = String(row[CONFIG.EXTRACT_NOM_COL - 1]).trim() || key;
+        nonTrouves.push({ key, nom: nomMachine });
+        Logger.log(`CAS 5 : "${key}" (${nomMachine}) absent de l'inventaire — à créer manuellement`);
+        continue;
+      }
+
+      // Cas 3 & 4 : présent dans l'inventaire, absent de discovery
+      // → aucune mise à jour, les données discovery ne sont pas fiables
+      if (cas === 3 || cas === 4) {
+        Logger.log(`CAS ${cas} : "${key}" absent de discovery — aucune modification`);
+        continue;
+      }
+
+      // Cas 1 & 2 : présent des deux côtés → on traite les écarts normalement
+      let invRowIdx = undefined;
+      let modeMatch = "";
+
       if (/^INV-/i.test(key) && invIndexParId[key] !== undefined) {
         invRowIdx = invIndexParId[key];
         modeMatch = "id";
-
-      // Cas 2 : clé absente ou nouvelle machine -> fallback sur le nom de la machine
       } else {
-        // La colonne "nom inventaire" dans l'extract (col 3 = index 2)
         const nomExtract = String(row[CONFIG.EXTRACT_NOM_COL - 1]).trim().toLowerCase();
         if (nomExtract && invIndexParNom[nomExtract] !== undefined) {
           invRowIdx = invIndexParNom[nomExtract];
@@ -286,8 +303,7 @@ function _executer(apercuSeulement) {
       }
 
       if (invRowIdx === undefined) {
-        nonTrouves.push(key);
-        Logger.log(`SKIP : "${key}" absent de l'inventaire (ni par ID ni par nom)`);
+        Logger.log(`SKIP : "${key}" (cas ${cas}) — introuvable dans l'inventaire ni par ID ni par nom`);
         continue;
       }
 
@@ -298,38 +314,45 @@ function _executer(apercuSeulement) {
         // ✅ Coche verte  → inventaire = discovery, rien à faire
         // –  Tiret        → pas de donnée discovery, rien à faire
         // ❌ Croix rouge  → différence détectée, on met à jour
-        const estOk     = matchVal === "✅" || matchVal === "☑" || matchVal === "✔" || matchVal === "✓";
-        const estTiret  = matchVal === "–"  || matchVal === "-" || matchVal === "—" || matchVal === "";
-        const estEcart  = matchVal === "❌" || matchVal === "✗" || matchVal === "✘" || matchVal === "×";
+        const estOk    = matchVal === "✅" || matchVal === "☑" || matchVal === "✔" || matchVal === "✓";
+        const estTiret = matchVal === "–"  || matchVal === "-" || matchVal === "—" || matchVal === "";
+        const estEcart = matchVal === "❌" || matchVal === "✗" || matchVal === "✘" || matchVal === "×";
 
-        if (estOk || estTiret) continue;  // Coche verte ou tiret → on skip
+        if (estOk || estTiret) continue;
         if (!estEcart) {
-          // Valeur inattendue : on log et on skip par sécurité
           Logger.log(`⚠️ Valeur de match inconnue pour "${champ}" (clé ${key}) : "${matchVal}" — ignoré`);
           continue;
         }
 
         let discoveryVal = String(row[CONFIG.MAPPING[champ].col - 1] ?? "").trim();
-        if (!discoveryVal) continue; // pas de valeur discovery, rien a faire
+
+        // Sécurité anti-écrasement : si la valeur discovery est vide ou N/A,
+        // on ne touche pas une donnée cohérente de l'inventaire
+        if (!discoveryVal) continue;
+        const discoveryNorm = discoveryVal.toUpperCase();
+        if (discoveryNorm === "N/A" || discoveryNorm === "NA" || discoveryNorm === "-") {
+          Logger.log(`SKIP N/A : ${key} / ${champ} — valeur discovery "${discoveryVal}" ignorée`);
+          continue;
+        }
 
         // Regle 1 : "DISCOVERED" (toutes variantes de casse) est remplace par 1
-        if (discoveryVal.toUpperCase() === "DISCOVERED") discoveryVal = "1";
+        if (discoveryNorm === "DISCOVERED") discoveryVal = "1";
 
         const invColIdx   = CONFIG.INVENTAIRE_COLS[champ] - 1;
         const invActuelle = String(invData[invRowIdx][invColIdx] ?? "").trim();
 
         // Regle 2 : comparaison insensible a la casse
-        // Si les valeurs sont identiques en ignorant la casse -> pas d'ecart
         if (discoveryVal.toLowerCase() === invActuelle.toLowerCase()) continue;
 
         actions.push({
           key,
+          cas,
           champ,
           ancienne:    invActuelle,
           nouvelle:    discoveryVal,
           invRowSheet: invRowIdx + 1,
           invColSheet: CONFIG.INVENTAIRE_COLS[champ],
-          modeMatch,   // "id" ou "nom" — pour traçabilité dans le rapport
+          modeMatch,
         });
       }
     }
@@ -341,15 +364,16 @@ function _executer(apercuSeulement) {
 
     // 4. Alerte nouvelles machines (Cas 5) — avant tout le reste
     if (nonTrouves.length > 0) {
-      const listeMachines = nonTrouves.map(k => `  • ${k}`).join("\n");
+      const listeMachines = nonTrouves
+        .map(m => `  • ${m.nom}${m.nom !== m.key ? "  (ID : " + m.key + ")" : ""}`)
+        .join("\n");
       ui.alert(
-        "🆕 Nouvelles machines détectées — Action opérateur requise",
-        `${nonTrouves.length} machine(s) présente(s) dans l'extract n'ont pas été trouvées dans l'inventaire` +
-        ` (ni par ID ni par nom).\n\n` +
-        `Ces machines sont à la charge de l'opérateur pour être ajoutées manuellement à l'inventaire :\n\n` +
+        "🆕 Cas 5 — Nouvelles machines à créer dans l'inventaire",
+        `${nonTrouves.length} machine(s) présente(s) dans Discovery n'ont pas de correspondance dans l'inventaire.\n\n` +
+        `Ces machines doivent être ajoutées manuellement :\n\n` +
         `${listeMachines}\n\n` +
-        `ℹ️ Ces entrées seront également listées dans le rapport final.\n` +
-        `La synchronisation des autres machines va continuer.`,
+        `ℹ️ Ces entrées sont également listées dans le rapport final.\n` +
+        `La synchronisation des autres machines continue.`,
         ui.ButtonSet.OK
       );
     }
@@ -633,16 +657,21 @@ function _ecrireRapport(invSS, actions, applique, nonTrouves) {
     r++;
   }
 
-  // Section machines non trouvées
+  // Section machines Cas 5 (non trouvées dans l'inventaire)
   if (nonTrouves && nonTrouves.length > 0) {
     let lastRow = sheet.getLastRow() + 2;
     sheet.getRange(lastRow, 1, 1, 3)
-      .setValues([["Machines non trouvées dans l'inventaire (ni par ID ni par nom)", "", ""]])
+      .setValues([["🆕 Cas 5 — Machines absentes de l'inventaire (à créer manuellement)", "", ""]])
       .setFontWeight("bold").setBackground("#FFCDD2");
     sheet.getRange(lastRow, 1, 1, 3).merge();
     lastRow++;
-    nonTrouves.forEach(k => {
-      sheet.getRange(lastRow, 1).setValue(k);
+    // En-têtes
+    sheet.getRange(lastRow, 1, 1, 2).setValues([["Nom machine", "Clé Discovery"]])
+      .setFontWeight("bold").setBackground("#FFEBEE");
+    lastRow++;
+    nonTrouves.forEach(m => {
+      sheet.getRange(lastRow, 1).setValue(m.nom);
+      sheet.getRange(lastRow, 2).setValue(m.key);
       lastRow++;
     });
   }
