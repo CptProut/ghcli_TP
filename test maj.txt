@@ -22,8 +22,10 @@ const CONFIG = {
   EXTRACT_CAS_COL: 2,      // Colonne "CAS" (1 à 5) — détermine le type de réconciliation
   EXTRACT_NOM_COL: 3,      // Colonne "Nom inventaire" (fallback pour nouvelles machines)
 
-  // Webhook Google Chat (espace de discussion cible)
+  // Webhook Google Chat — espace principal (rapport de sync)
   GOOGLE_CHAT_WEBHOOK: "https://chat.googleapis.com/v1/spaces/XXXXXXX/messages?key=XXXXXX&token=XXXXXX",
+  // Webhook Google Chat — espace dédié Cas 5 (nouvelles machines à créer)
+  GOOGLE_CHAT_WEBHOOK_CAS5: "https://chat.googleapis.com/v1/spaces/XXXXXXX/messages?key=XXXXXX&token=XXXXXX",
 
   // Onglet rapport (sera créé/écrasé dans l'inventaire)
   RAPPORT_TAB: "Rapport_Sync",
@@ -426,6 +428,11 @@ function _executer(apercuSeulement) {
 
     // 8. Envoyer la carte Google Chat
     _envoyerGoogleChatCard(actions);
+
+    // 9. Envoyer la carte Cas 5 si besoin
+    if (nonTrouves.length > 0) {
+      _envoyerGoogleChatCardCas5(nonTrouves);
+    }
 
     ui.alert(
       "✅ Synchronisation terminée",
@@ -841,6 +848,74 @@ function _envoyerGoogleChatCard(actions) {
   }
 }
 
+
+// ============================================================
+//  NOTIFICATION GOOGLE CHAT — CAS 5
+// ============================================================
+function _envoyerGoogleChatCardCas5(nonTrouves) {
+  const now = new Date();
+
+  // Widgets : une ligne par machine
+  const machineWidgets = nonTrouves.map(m => ({
+    decoratedText: {
+      topLabel: m.key,
+      text: m.nom !== m.key ? m.nom : "(nom non disponible)",
+      startIcon: { knownIcon: "COMPUTER" },
+    }
+  }));
+
+  const card = {
+    cardsV2: [{
+      cardId: "cas5-rapport",
+      card: {
+        header: {
+          title: "🆕 Nouvelles machines à créer",
+          subtitle: `${nonTrouves.length} machine(s) détectée(s) — ${now.toLocaleString("fr-FR")}`,
+          imageUrl: "https://fonts.gstatic.com/s/i/googlematerialicons/add_circle/v6/googlematerialicons-add_circle-48dp.png",
+          imageType: "CIRCLE",
+        },
+        sections: [
+          {
+            header: `🖥️ Machines absentes de l'inventaire (Cas 5)`,
+            collapsible: false,
+            widgets: machineWidgets,
+          },
+          {
+            widgets: [{
+              buttonList: {
+                buttons: [{
+                  text: "Ouvrir l'inventaire",
+                  icon: { knownIcon: "OPEN_IN_NEW" },
+                  onClick: {
+                    openLink: {
+                      url: SpreadsheetApp.getActiveSpreadsheet().getUrl(),
+                    }
+                  }
+                }]
+              }
+            }]
+          }
+        ]
+      }
+    }]
+  };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(card),
+    muteHttpExceptions: true,
+  };
+
+  const response = UrlFetchApp.fetch(CONFIG.GOOGLE_CHAT_WEBHOOK_CAS5, options);
+  const code     = response.getResponseCode();
+
+  if (code !== 200) {
+    Logger.log(`⚠️ Google Chat Cas 5 webhook — réponse HTTP ${code} : ${response.getContentText()}`);
+  } else {
+    Logger.log(`Notification Cas 5 envoyée : ${nonTrouves.length} machine(s).`);
+  }
+}
 
 // ============================================================
 //  OUVRIR RAPPORT
