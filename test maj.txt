@@ -685,10 +685,10 @@ function _ecrireRapport(invSS, actions, applique, nonTrouves) {
 
     // Titre de la section
     const nbColsCas5 = Object.keys(CONFIG.MAPPING).length + 2; // Nom + Clé + champs MAPPING
-    sheet.getRange(lastRow, 1, 1, nbColsCas5)
-      .setValues([["🆕 Cas 5 — Machines absentes de l'inventaire (à créer manuellement)" + " ".repeat(nbColsCas5)]])
+    const titreCas5Range = sheet.getRange(lastRow, 1, 1, nbColsCas5);
+    titreCas5Range.merge();
+    titreCas5Range.setValue("🆕 Cas 5 — Machines absentes de l'inventaire (à créer manuellement)")
       .setFontWeight("bold").setBackground("#FFCDD2");
-    sheet.getRange(lastRow, 1, 1, nbColsCas5).merge();
     lastRow++;
 
     // En-têtes : Nom machine + Clé Discovery + un colonne par champ du MAPPING
