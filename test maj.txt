@@ -1,24 +1,12 @@
-function diagnosticR71() {
+function diagnosticHebergement() {
   const ss    = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Inventaire serveurs");
-  const cell  = sheet.getRange("R71");
-
-  Logger.log("Valeur actuelle R71 : " + cell.getValue());
-
-  const v = cell.getDataValidation();
-  if (v) {
-    const type   = v.getCriteriaType();
-    const values = v.getCriteriaValues();
-    Logger.log("Type validation : " + type);
-    Logger.log("Valeurs autorisées : " + JSON.stringify(values));
-    Logger.log("Rejeter si invalide : " + !v.getAllowInvalid());
-  } else {
-    Logger.log("Aucune validation sur R71");
-  }
-
-  // Test : est-ce qu'on arrive à désactiver la DDL et écrire ?
-  const valeurTest = cell.getValue(); // on réécrit la même valeur
-  cell.clearDataValidations();
-  cell.setValue(valeurTest);
-  Logger.log("Écriture test OK avec clearDataValidations() cellule par cellule");
+  
+  // Ligne 71 = index 70 dans getValues (base 0)
+  const row = sheet.getRange(71, 1, 1, 35).getValues()[0];
+  
+  Logger.log("Col 17 (idx 16) : " + row[16]);
+  Logger.log("Col 18 (idx 17) : " + row[17]);
+  Logger.log("Col 19 (idx 18) : " + row[18]);
+  Logger.log("Col 20 (idx 19) : " + row[19]);
 }
