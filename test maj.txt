@@ -1,2 +1,27 @@
-const cas = parseInt(String(row[CONFIG.EXTRACT_CAS_COL - 1]).trim(), 10);
-Logger.log(`Ligne ${e} — clé="${key}" — valeur brute CAS="${row[CONFIG.EXTRACT_CAS_COL - 1]}" — cas parsé=${cas}`);
+function diagnosticR71() {
+  const ss    = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Inventaire serveurs");
+  const cell  = sheet.getRange("R71");
+
+  // Valeur actuelle
+  Logger.log("Valeur actuelle R71 : " + cell.getValue());
+
+  // Validation DDL
+  const v = cell.getDataValidation();
+  if (v) {
+    const type   = v.getCriteriaType();
+    const values = v.getCriteriaValues();
+    Logger.log("Type validation : " + type);
+    Logger.log("Valeurs autorisées : " + JSON.stringify(values));
+    Logger.log("Rejet strict : " + v.getAllowInvalid());
+  } else {
+    Logger.log("Aucune validation sur R71");
+  }
+
+  // Triggers installés sur ce spreadsheet
+  const triggers = ScriptApp.getProjectTriggers();
+  Logger.log("Nombre de triggers : " + triggers.length);
+  for (const t of triggers) {
+    Logger.log("Trigger : " + t.getHandlerFunction() + " / " + t.getEventType());
+  }
+}
