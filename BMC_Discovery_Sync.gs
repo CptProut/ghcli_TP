@@ -84,8 +84,23 @@ const CONFIG = {
   },
 };
 
-// Valeurs non significatives à ignorer (toutes variantes de N/A)
-const VALEURS_IGNOREES = ["N/A", "NA", "#N/A", "-", "--", "NONE", "NULL", "UNKNOWN", "N.A.", "N.A"];
+// ============================================================
+//  VALEURS NON SIGNIFICATIVES
+//  CORRECTIF : liste étendue + fonction centralisée estValeurVide()
+//  Toute valeur Discovery correspondant à l'une de ces entrées
+//  (après trim + uppercase) est considérée comme "pas de donnée"
+//  et ne déclenche AUCUNE écriture dans l'inventaire.
+// ============================================================
+const VALEURS_IGNOREES = [
+  "N/A", "NA", "#N/A", "-", "--", "---",
+  "NONE", "NULL", "UNKNOWN", "N.A.", "N.A",
+  "NOT AVAILABLE", "NOT APPLICABLE", "UNDEFINED", "EMPTY", "",
+];
+
+function estValeurVide(val) {
+  if (val === null || val === undefined) return true;
+  return VALEURS_IGNOREES.includes(String(val).trim().toUpperCase());
+}
 
 // ============================================================
 //  MENU
@@ -223,7 +238,7 @@ function _executer(apercuSeulement) {
         const valeursDiscovery = {};
         for (const [champ, def] of Object.entries(CONFIG.MAPPING)) {
           const val  = String(row[def.col - 1] ?? "").trim();
-          valeursDiscovery[champ] = VALEURS_IGNOREES.includes(val.toUpperCase()) ? "" : val;
+          valeursDiscovery[champ] = estValeurVide(val) ? "" : val;
         }
         nonTrouves.push({ key, nom: nomMachine, valeursDiscovery });
         Logger.log(`CAS 5 : "${key}" — nom="${nomMachine}"`);
@@ -270,20 +285,24 @@ function _executer(apercuSeulement) {
           continue;
         }
 
+        // ── Lecture valeur Discovery ──
         let discoveryVal = String(row[CONFIG.MAPPING[champ].col - 1] ?? "").trim();
-        if (!discoveryVal) continue;
 
-        const discoveryNorm = discoveryVal.toUpperCase().trim();
-        if (VALEURS_IGNOREES.includes(discoveryNorm)) {
-          Logger.log(`SKIP N/A : ${key} / ${champ} — "${discoveryVal}" ignorée`);
+        // CORRECTIF PRINCIPAL : utiliser estValeurVide() au lieu du test !discoveryVal seul.
+        // Cela couvre UNKNOWN, NULL, NONE, N/A et toutes leurs variantes.
+        // Si Discovery n'a pas de valeur significative → on ne touche PAS l'inventaire,
+        // même si la colonne MATCH indique ❌ (écart dû à l'extract, pas à nos données).
+        if (estValeurVide(discoveryVal)) {
+          Logger.log(`SKIP valeur vide/inconnue : ${key} / ${champ} — "${discoveryVal}" ignorée`);
           continue;
         }
 
-        if (discoveryNorm === "DISCOVERED") discoveryVal = "1";
+        if (discoveryVal.toUpperCase() === "DISCOVERED") discoveryVal = "1";
 
         const invColIdx   = CONFIG.INVENTAIRE_COLS[champ] - 1;
         const invActuelle = String(invData[invRowIdx][invColIdx] ?? "").trim();
 
+        // Si après normalisation les valeurs sont identiques, rien à faire
         if (discoveryVal.toLowerCase() === invActuelle.toLowerCase()) continue;
 
         const nomDisc = String(row[CONFIG.MAPPING["Nom"].col - 1] ?? "").trim();
@@ -373,8 +392,6 @@ function _appliquerModifications(invSheet, actions) {
   const notes    = plage.getNotes();
 
   // ── Lire les validations DDL par colonne ──
-  // CORRECTIF : on scanne les 20 premières lignes pour trouver une cellule
-  // avec validation, au cas où la ligne 2 serait vide (ex: colonne Hébergement)
   ss.toast("Lecture des validations...", "Synchronisation en cours", 10);
   const colsUniques      = [...new Set(actions.map(a => a.invColSheet))];
   const validationParCol = {};
@@ -395,6 +412,15 @@ function _appliquerModifications(invSheet, actions) {
     const colIdx     = action.invColSheet - 1;
 
     try {
+      // DOUBLE-FILET : si par quelque biais la valeur à écrire est vide/inconnue,
+      // on n'écrit rien. Ne devrait plus arriver grâce au filtre dans _executer,
+      // mais on blinde ici aussi.
+      if (estValeurVide(action.nouvelle)) {
+        Logger.log(`DOUBLE-FILET : ${action.key} / ${action.champ} — "${action.nouvelle}" non écrite (valeur vide/inconnue)`);
+        action.statut = "SKIP_VIDE";
+        continue;
+      }
+
       let valeurAEcrire = action.nouvelle;
       action.horsListe  = false;
 
@@ -464,10 +490,12 @@ function _appliquerModifications(invSheet, actions) {
 
   const ok        = actions.filter(a => a.statut === "OK").length;
   const horsListe = actions.filter(a => a.statut === "OK_HORS_LISTE").length;
+  const skips     = actions.filter(a => a.statut === "SKIP_VIDE").length;
   const echecs    = actions.filter(a => a.statut === "ECHEC").length;
 
   let bilanMsg = `${ok} mise(s) à jour OK`;
   if (horsListe > 0) bilanMsg += ` | ${horsListe} hors liste DDL`;
+  if (skips     > 0) bilanMsg += ` | ${skips} ignorée(s) (valeur vide/inconnue)`;
   if (echecs    > 0) bilanMsg += ` | ${echecs} échec(s)`;
   ss.toast(bilanMsg, "Synchronisation terminée", 8);
 }
@@ -548,6 +576,7 @@ function _ecrireRapport(invSS, actions, applique, nonTrouves) {
     !applique                       ? "En attente"
     : a.statut === "ECHEC"          ? "ECHEC - " + (a.erreur || "")
     : a.statut === "OK_HORS_LISTE"  ? "Hors liste DDL"
+    : a.statut === "SKIP_VIDE"      ? "Ignoré (valeur vide/inconnue)"
     : "OK",
   ]);
 
