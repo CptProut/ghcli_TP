@@ -1,15 +1,16 @@
-function diagnosticDiscoveryHebergement() {
-  const ss       = SpreadsheetApp.getActiveSpreadsheet();
-  const extSheet = ss.getSheetByName("Feuille 1"); // ou le nom de ton extract si différent
-  
-  // Cherche toutes les lignes où Hébergement col 25 contient CLARANET
-  const data = extSheet.getDataRange().getValues();
-  for (let i = 1; i < data.length; i++) {
-    const hebergement = String(data[i][24] ?? "").trim(); // col 25 = index 24
-    const match       = String(data[i][25] ?? "").trim(); // col 26 = colonne MATCH
-    if (hebergement.toUpperCase().includes("CLARANET")) {
-      Logger.log(`Ligne ${i+1} — Discovery val : "${hebergement}" | MATCH col 26 : "${match}"`);
-      Logger.log(`Codes char : ${[...hebergement].map(c => c.charCodeAt(0)).join(",")}`);
-    }
-  }
+const valeurDansListe = valeursAutorisees.find(
+  v => String(v).trim().toLowerCase() === String(action.nouvelle).trim().toLowerCase()
+);
+
+// Normalisation de casse dans tous les cas, même si DDL en mode avertissement
+valeurAEcrire = valeurDansListe !== undefined
+  ? String(valeurDansListe).trim()
+  : action.nouvelle;
+
+if (valeurDansListe !== undefined && valeurAEcrire !== action.nouvelle) {
+  action.avertissement = `Casse normalisée : "${action.nouvelle}" → "${valeurAEcrire}"`;
+  action.nouvelle      = valeurAEcrire;
+} else if (valeurDansListe === undefined) {
+  action.horsListe     = true;
+  action.avertissement = `"${action.nouvelle}" hors liste — écrit quand même`;
 }
