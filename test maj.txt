@@ -1,16 +1,9 @@
-const valeurDansListe = valeursAutorisees.find(
-  v => String(v).trim().toLowerCase() === String(action.nouvelle).trim().toLowerCase()
-);
-
-// Normalisation de casse dans tous les cas, même si DDL en mode avertissement
-valeurAEcrire = valeurDansListe !== undefined
-  ? String(valeurDansListe).trim()
-  : action.nouvelle;
-
-if (valeurDansListe !== undefined && valeurAEcrire !== action.nouvelle) {
-  action.avertissement = `Casse normalisée : "${action.nouvelle}" → "${valeurAEcrire}"`;
-  action.nouvelle      = valeurAEcrire;
-} else if (valeurDansListe === undefined) {
-  action.horsListe     = true;
-  action.avertissement = `"${action.nouvelle}" hors liste — écrit quand même`;
+POST https://api.opsgenie.com/v2/schedules/{scheduleId}/overrides
+Headers: Authorization: GenieKey {API_KEY}
+Body: {
+  "user": { "type": "user", "username": "jean.dupont@entreprise.fr" },
+  "startDate": "2026-07-01T08:00:00Z",
+  "endDate": "2026-07-02T08:00:00Z"
 }
+
+https://api.atlassian.com/jsm/ops/integration/v2/
