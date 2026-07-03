@@ -1,9 +1,35 @@
-POST https://api.opsgenie.com/v2/schedules/{scheduleId}/overrides
-Headers: Authorization: GenieKey {API_KEY}
-Body: {
-  "user": { "type": "user", "username": "jean.dupont@entreprise.fr" },
-  "startDate": "2026-07-01T08:00:00Z",
-  "endDate": "2026-07-02T08:00:00Z"
-}
+CLOUD_ID="d6d8de95-d2c7-4567-abef-04c147b1d0fa"
+SCHED_ID="5c7d03ed-d8c6-489f-9e0c-fc63a657aa0e"
+AUTH="ton.email@nickel.eu:TON_NOUVEAU_TOKEN"
+SITE="https://tonsite.atlassian.net"
 
-https://api.atlassian.com/jsm/ops/integration/v2/
+# a) timeline sur 2 semaines
+curl -s --user "$AUTH" -H 'Accept: application/json' \
+  "https://api.atlassian.com/jsm/ops/api/$CLOUD_ID/v1/schedules/$SCHED_ID/timeline?interval=2&intervalUnit=weeks" \
+  > timeline.json
+
+# b) extraire les accountId uniques et les résoudre en noms via Jira
+IDS=$(jq -r '[.. | objects | select(.type?=="user") | .id] | unique | map("accountId="+.) | join("&")' timeline.json)
+
+curl -s --user "$AUTH" -H 'Accept: application/json' \
+  "$SITE/rest/api/3/user/bulk?maxResults=50&$IDS" \
+  > users.json
+
+# c) afficher la timeline avec les noms injectés
+jq --slurpfile u users.json '
+  ($u[0].values | map({(.accountId): .displayName}) | add) as $names
+  | walk(if type=="object" and .id? and $names[.id] then . + {name: $names[.id]} else . end)
+' timeline.json
+
+curl -s --request POST \
+  --url "https://api.atlassian.com/jsm/ops/api/$CLOUD_ID/v1/schedules/$SCHED_ID/overrides" \
+  --user "$AUTH" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "responder": {"type": "user", "id": "631066886a8bb4eda67728ae"},
+    "startDate": "2026-07-04T19:00:00+02:00",
+    "endDate": "2026-07-05T09:00:00+02:00"
+  }'
+curl -s --request DELETE --user "$AUTH" \
+  "https://api.atlassian.com/jsm/ops/api/$CLOUD_ID/v1/schedules/$SCHED_ID/overrides/ID_DE_LOVERRIDE"
+
