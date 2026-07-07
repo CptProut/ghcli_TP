@@ -1,36 +1,26 @@
-curl -s --request POST \
-  --url "https://api.atlassian.com/jsm/ops/api/$CLOUD_ID/v1/schedules/$SCHED_ID/overrides" \
-  --user "$AUTH" \
-  --header 'Content-Type: application/json' \
-  --data '{
-    "responder": {"type": "user", "id": "631066886a8bb4eda67728ae"},
-    "startDate": "2026-07-04T19:00:00+02:00",
-    "endDate": "2026-07-05T09:00:00+02:00"
-  }'
+function onMessage(event) {
+  var name = event.user.displayName;
+  var text = event.message.text;
 
-curl -s --request DELETE --user "$AUTH" \
-  "https://api.atlassian.com/jsm/ops/api/$CLOUD_ID/v1/schedules/$SCHED_ID/overrides/COLLE_ID_ICI"
+  var card = CardService.newCardBuilder()
+    .addSection(
+      CardService.newCardSection().addWidget(
+        CardService.newTextParagraph().setText(name + " a dit : " + text)
+      )
+    )
+    .build();
 
-
-function doPost(e) {
-  // Récupère l'événement envoyé par Google Chat
-  var event = JSON.parse(e.postData.contents);
-  var reply = {};
-
-  // Gère l'événement selon son type
-  if (event.type === 'ADDED_TO_SPACE') {
-    reply = { "text": "Salut ! Merci de m'avoir ajouté." };
-  } else if (event.type === 'MESSAGE') {
-    var name = event.user.displayName;
-    var text = event.message.text;
-    reply = { "text": name + " a dit : " + text };
-  }
-
-  // Renvoie la réponse au bon format HTTP pour Google Chat
-  return ContentService.createTextOutput(JSON.stringify(reply))
-    .setMimeType(ContentService.MimeType.JSON);
+  return { cardsV2: [{ cardId: "card1", card: card }] };
 }
 
-// On garde tes anciennes fonctions au cas où
-function onAddedToSpace(event) { return doPost({postData: {contents: JSON.stringify(event)}}); }
-function onMessage(event) { return doPost({postData: {contents: JSON.stringify(event)}}); }
+function onAddedToSpace(event) {
+  var card = CardService.newCardBuilder()
+    .addSection(
+      CardService.newCardSection().addWidget(
+        CardService.newTextParagraph().setText("Merci de l'ajout !")
+      )
+    )
+    .build();
+
+  return { cardsV2: [{ cardId: "card1", card: card }] };
+}
