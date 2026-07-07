@@ -1,26 +1,10 @@
 function onMessage(event) {
-  var name = event.user.displayName;
-  var text = event.message.text;
-
-  var card = CardService.newCardBuilder()
-    .addSection(
-      CardService.newCardSection().addWidget(
-        CardService.newTextParagraph().setText(name + " a dit : " + text)
-      )
-    )
-    .build();
-
-  return { cardsV2: [{ cardId: "card1", card: card }] };
+  console.log("Event reçu : " + JSON.stringify(event));
+  var response = { text: "Romain a dit Caca" };
+  console.log("Réponse envoyée : " + JSON.stringify(response));
+  return response;
 }
 
 function onAddedToSpace(event) {
-  var card = CardService.newCardBuilder()
-    .addSection(
-      CardService.newCardSection().addWidget(
-        CardService.newTextParagraph().setText("Merci de l'ajout !")
-      )
-    )
-    .build();
-
-  return { cardsV2: [{ cardId: "card1", card: card }] };
+  return { text: "Coucou tu veux voir mon bot ?" };
 }
