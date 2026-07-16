@@ -1,375 +1,96 @@
-/**
- * Envoi un google tchat basé sur le planing d'astreinte
- */
+function onMessage(event) {
+  var name = "";
 
-
-function notifierPlanningGoogleChat() {
-
-const urlWebhook = "https://chat.googleapis.com/v1/spaces/AAAA-ap88dI/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=sjveyg7C04fW7AdyeiulWYVmnRpXgE5UJ6kEU20lTBY";
-
-
-const ss = SpreadsheetApp.getActiveSpreadsheet();
-
-const nomfeuilleAstreinte = "Astreinte";
-const nomfeuilleRunners = "Planning_RUN_2026";
-
-
-
-const aujourdhui = new Date();
-const numeroSemaine = getWeekNumber(aujourdhui).toString();
-const datesAffiche = getRangeDate(aujourdhui)
-Logger.log("Numero de semain calc :" + numeroSemaine);
-//const numeroSemaine = 51;
-
-
-let agentSemaine ="", agentWeekend = "";
-let runner1 = "", runner2= "";
-
-
-//Agents d'astreinte
-const fAstreinte = ss.getSheetByName(nomfeuilleAstreinte);
-if (fAstreinte) {
-  const donnees = fAstreinte.getDataRange().getDisplayValues();
-  for ( var i = 0; i < donnees.length; i++){
-    var texteCellule = donnees[i][0];
-    Logger.log(texteCellule)
-    if (texteCellule !== "" && texteCellule === numeroSemaine){
-      agentSemaine = donnees[i][1];
-      agentWeekend = donnees[i][2];
-      break;
+  // Commande /astreinte
+  if (event.message.slashCommand) {
+    if (event.message.slashCommand.commandId == 1) { // vérifie l'ID configuré dans Cloud Console
+      return getAstreinteCard();
     }
   }
+
+  if (event.space.type == "DM") {
+    name = "You";
+  } else {
+    name = event.user.displayName;
+  }
+
+  var message = name + " said \"" + event.message.text + "\"";
+  return { "text": message };
 }
 
-//Agents Runner
-const fRunners = ss.getSheetByName(nomfeuilleRunners);
-if (fRunners) {
-  const donnees = fRunners.getDataRange().getDisplayValues();
-  for ( var j = 2 ; j < donnees.length; j++){
-    var texteCellule = donnees[j][0];
-    Logger.log(texteCellule)
-    if (texteCellule !== "" && texteCellule === numeroSemaine){
-      runner1 = donnees[j][3];
-      runner2 = donnees[j][4];
-      break;
+const ID_SHEET_ASTREINTE = "1ud_1lXLqFqCZWdOb8UreBS9sffI0GidnRaiXy_dY6TY";
+
+function getAstreinteCard() {
+  const ss = SpreadsheetApp.openById(ID_SHEET_ASTREINTE);
+  const nomfeuilleAstreinte = "Astreinte";
+
+  const aujourdhui = new Date();
+  const numeroSemaine = getWeekNumber(aujourdhui).toString();
+  const datesAffiche = getRangeDate(aujourdhui);
+
+  let agentSemaine = "", agentWeekend = "";
+
+  const fAstreinte = ss.getSheetByName(nomfeuilleAstreinte);
+  if (fAstreinte) {
+    const donnees = fAstreinte.getDataRange().getDisplayValues();
+    for (var i = 0; i < donnees.length; i++) {
+      var texteCellule = donnees[i][0];
+      if (texteCellule !== "" && texteCellule === numeroSemaine) {
+        agentSemaine = donnees[i][1];
+        agentWeekend = donnees[i][2];
+        break;
+      }
     }
   }
-}
 
-//Random Point CDC et Point Clara
-
-  var equipe = ["Romain","Charles","Simon","Valentin"];
-  var indexCDC = Math.floor(Math.random() * equipe.length);
-  var cdc = equipe[indexCDC];
-  var equipeRestante = equipe.filter(function(membre) {
-    return membre !== cdc;
-  });
-
-  var indexClara = Math.floor(Math.random() * equipeRestante.length);
-  var pointClara = equipeRestante[indexClara];
-
-//Envoi message
-
-  const cardPayload = {
+  return {
     "cardsV2": [{
-      "cardId": "planningCard",
-      "card":{
+      "cardId": "astreinteCard",
+      "card": {
         "header": {
-          "title": "Planning de la Semaine " + numeroSemaine,
-          "subtitle": "Du " + datesAffiche + " les gagnants sont :",
-          "imageUrl":"https://les-gourmandises-de-nathalie.com/wp-content/uploads/2018/04/salade-de-fruits-buffet-exotique.png",
-          "imageType": "CIRCLE"
+          "title": "Astreinte - Semaine " + numeroSemaine,
+          "subtitle": "Du " + datesAffiche
         },
         "sections": [
           {
-            "header": "Astreinte",
             "widgets": [
               {
                 "decoratedText": {
-                  "startIcon": { "materialIcon": { "name": "wb_sunny", "fill": true, "weight": 300, "grade": -25} },
+                  "startIcon": { "materialIcon": { "name": "wb_sunny", "fill": true, "weight": 300, "grade": -25 } },
                   "topLabel": "EN SEMAINE",
-                  "text": "<b>" + agentSemaine + "<b>"
+                  "text": "<b>" + agentSemaine + "</b>"
                 }
               },
-               {
+              {
                 "decoratedText": {
-                  "startIcon": { "materialIcon": { "name": "nights_stay", "fill": true, "weight": 300, "grade": -25} },
+                  "startIcon": { "materialIcon": { "name": "nights_stay", "fill": true, "weight": 300, "grade": -25 } },
                   "topLabel": "WEEK-END",
-                  "text": "<b>" + agentWeekend + "<b>"
-                }
-              }
-            ]
-          },
-          {
-            "header": "Runner",
-            "widgets": [
-              {
-                "decoratedText": {
-                  "startIcon": { "materialIcon": { "name": "catching_pokemon", "fill": true, "weight": 300, "grade": -25} },
-                  "topLabel": "RUNNER 1",
-                  "text": "<b>" + runner1 + "<b>"
-                }
-              },
-               {
-                "decoratedText": {
-                  "startIcon": { "materialIcon": { "name": "catching_pokemon", "fill": true, "weight": 300, "grade": -25} },
-                  "topLabel": "RUNNER 2",
-                  "text": "<b>" + runner2 + "<b>"
-                }
-              }
-            ]
-          },
-                    {
-            "header": "Sont attendu au CDC et au Point Clara",
-            "widgets": [
-              {
-                "decoratedText": {
-                  "startIcon": { "materialIcon": { "name": "cycle", "fill": true, "weight": 300, "grade": -25} },
-                  "topLabel": "Comité de Changement ",
-                  "text": "<b>" + cdc + "<b>"
-                }
-              },
-               {
-                "decoratedText": {
-                  "startIcon": { "materialIcon": { "name": "threat_intelligence", "fill": true, "weight": 300, "grade": -25} },
-                  "topLabel": "Au point Claranet",
-                  "text": "<b>" + pointClara + "<b>"
-                }
-              }
-            ]
-          },
-              {
-      "header": "Liens",
-      "collapsible": true,
-      "uncollapsibleWidgetsCount": 1,
-      "widgets": [
-        {
-          "buttonList": {
-            "buttons": [
-              {
-                "text": "Planning OpsGenie",
-                "icon": {
-                  "iconUrl": "https://dt-cdn.net/hub/logos/opsgenie.png",
-                  "altText": "Le caca c'est delicieux"
-                },
-                "type": "FILLED",
-                "onClick": {
-                  "openLink": {
-                    "url": "https://compte-nickel.app.opsgenie.com/teams/dashboard/c7c557b6-715b-469f-a04c-3c8d287ab7aa/main"
-                  }
-                }
-              },
-              {
-                "text": "Google Sheet Reference",
-                "icon": {
-                  "iconUrl": "https://static.vecteezy.com/system/resources/previews/017/396/799/non_2x/google-sheets-apps-logo-free-png.png",
-                  "altText": "Contact"
-                },
-                  "color": {
-                  "red": 0.058,
-                  "green": 0.615,
-                  "blue": 0.345,
-                  "alpha": 1
-                },
-                "type": "OUTLINED",
-                "onClick": {
-                  "openLink": {
-                    "url": "https://docs.google.com/spreadsheets/d/1ud_1lXLqFqCZWdOb8UreBS9sffI0GidnRaiXy_dY6TY/edit?usp=sharing"
-                  }
+                  "text": "<b>" + agentWeekend + "</b>"
                 }
               }
             ]
           }
-        }
-      ]
-    }
         ]
       }
     }]
   };
-
-  const options = {
-    "method": "post",
-    "contentType": "application/json",
-    "payload" : JSON.stringify(cardPayload)
-  };
-
-  UrlFetchApp.fetch(urlWebhook, options);
 }
-
-function notifierPlanningGoogleChatPAT() {
-const urlWebhookRunner = "https://chat.googleapis.com/v1/spaces/AAAATpc6-sY/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=y1ubo1Nm0kSikiikQc0HXRJEC3foHe9aPh1RmfLmnQo";
-
-
-const ss = SpreadsheetApp.getActiveSpreadsheet();
-
-const nomfeuilleRunners = "Planning_RUN_2026";
-
-
-
-const aujourdhui = new Date();
-const numeroSemaine = getWeekNumber(aujourdhui).toString();
-const datesAffiche = getRangeDate(aujourdhui)
-
-let runner1 = "", runner2= "";
-
-
-
-//Agents Runner
-const fRunners = ss.getSheetByName(nomfeuilleRunners);
-if (fRunners) {
-  const donnees = fRunners.getDataRange().getDisplayValues();
-  for ( var j = 2 ; j < donnees.length; j++){
-    var texteCellule = donnees[j][0];
-    Logger.log(texteCellule)
-    if (texteCellule !== "" && texteCellule === numeroSemaine){
-      runner1 = donnees[j][3];
-      runner2 = donnees[j][4];
-      break;
-    }
-  }
-}
-
-//Envoi message
-
-  const cardPayload2 = {
-    "cardsV2": [{
-      "cardId": "planningCard",
-      "card":{
-        "header": {
-          "title": "Planning de la Semaine " + numeroSemaine,
-          "subtitle": "Du " + datesAffiche + " les gagnants sont :",
-          "imageUrl":"https://les-gourmandises-de-nathalie.com/wp-content/uploads/2018/04/salade-de-fruits-buffet-exotique.png",
-          "imageType": "CIRCLE"
-        },
-        "sections": [
-          {
-            "header": "Runner",
-            "widgets": [
-              {
-                "decoratedText": {
-                  "startIcon": { "materialIcon": { "name": "catching_pokemon", "fill": true, "weight": 300, "grade": -25} },
-                  "topLabel": "RUNNER 1",
-                  "text": "<b>" + runner1 + "<b>"
-                }
-              },
-               {
-                "decoratedText": {
-                  "startIcon": { "materialIcon": { "name": "catching_pokemon", "fill": true, "weight": 300, "grade": -25} },
-                  "topLabel": "RUNNER 2",
-                  "text": "<b>" + runner2 + "<b>"
-                }
-              }
-            ]
-          },
-              {
-      "header": "Liens",
-      "collapsible": true,
-      "uncollapsibleWidgetsCount": 1,
-      "widgets": [
-        {
-          "buttonList": {
-            "buttons": [
-              {
-                "text": "Planning OpsGenie",
-                "icon": {
-                  "iconUrl": "https://dt-cdn.net/hub/logos/opsgenie.png",
-                  "altText": "Le caca c'est delicieux"
-                },
-                "type": "FILLED",
-                "onClick": {
-                  "openLink": {
-                    "url": "https://compte-nickel.app.opsgenie.com/teams/dashboard/c7c557b6-715b-469f-a04c-3c8d287ab7aa/main"
-                  }
-                }
-              },
-              {
-                "text": "Google Sheet Reference",
-                "icon": {
-                  "iconUrl": "https://static.vecteezy.com/system/resources/previews/017/396/799/non_2x/google-sheets-apps-logo-free-png.png",
-                  "altText": "Contact"
-                },
-                  "color": {
-                  "red": 0.058,
-                  "green": 0.615,
-                  "blue": 0.345,
-                  "alpha": 1
-                },
-                "type": "OUTLINED",
-                "onClick": {
-                  "openLink": {
-                    "url": "https://docs.google.com/spreadsheets/d/1mlOhaEPtHNsjpjRROGL_YqH86b7zz7hmVWCx55pergM/edit?usp=sharing"
-                  }
-                }
-              }
-            ]
-          }
-        }
-      ]
-    }
-        ]
-      }
-    }]
-  };
-
-  const options = {
-    "method": "post",
-    "contentType": "application/json",
-    "payload" : JSON.stringify(cardPayload2)
-  };
-
-  UrlFetchApp.fetch(urlWebhookRunner, options);
-}
-
 
 function getWeekNumber(d) {
   d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
   d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
   var yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-  var WeekNo = Math.ceil((((d- yearStart) / 86400000) + 1) /7 );
+  var WeekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
   return WeekNo;
 }
 
 function getRangeDate(d) {
   var jour = d.getDay();
   var diffLundi = d.getDate() - jour + (jour == 0 ? -6 : 1);
-
   var Lundi = new Date(d.setDate(diffLundi));
   var Dimanche = new Date(d.setDate(Lundi.getDate() + 6));
-
-  //On formate ce merdier
   var f = function(date) {
     return Utilities.formatDate(date, "GMT+1", "dd/MM");
   };
-
- return f(Lundi) + " au " + f(Dimanche) + ",";
-}
-
-function PetitCurieux(){
-  const urlwebhookeaster = "https://chat.googleapis.com/v1/spaces/AAAAcXNsCyw/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=By31_h99EpIezBkI36kmybHdAQkEeK0k9iTlvzDFEEs"
-  const userEmail = Session.getActiveUser().getEmail();
-  const username = userEmail.split('@')[0];
-
-  const cardPayload2 = {
-    "cardsV2": [{
-      "cardId": "planningCard",
-      "card":{
-        "header": {
-          "title": "ALERTE ALERTE ALERTE ",
-          "subtitle": "L'incroyable " + username + " est un curieux qui a cliqué sur le bouton interdit",
-          "imageUrl":"https://les-gourmandises-de-nathalie.com/wp-content/uploads/2018/04/salade-de-fruits-buffet-exotique.png",
-          "imageType": "CIRCLE"
-        }
-      }
-    }]
-  };
-  const options = {
-    "method": "post","contentType": "application/json","payload": JSON.stringify(cardPayload2)
-
-  };
-  UrlFetchApp.fetch(urlwebhookeaster , options);
-}
-
-function tirageAuSortCDCetClara() {
-
+  return f(Lundi) + " au " + f(Dimanche) + ",";
 }
