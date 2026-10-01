@@ -1,12 +1,15 @@
-# Installation Nextcloud Enterprise Edition sur RHEL 9.8 (BDD déportée)
+{info:title=Document}
+*Installation Nextcloud Enterprise Edition sur RHEL 9.8 (BDD PostgreSQL locale)*
+Rédigé le 17/09/2026 par Capitaine — mis à jour le 01/10/2026 (installation à partir de l'archive .zip déposée sur la VM).
+{info}
 
-Sep 17, 2026 · @Capitaine
+{toc:maxLevel=3}
 
-## 0. Vérification des spécifications de la VM
+h1. 0. Vérification des spécifications de la VM
 
-Avant toute installation, valider que la VM respecte le dimensionnement minimum retenu (4 vCPU / 8 Go RAM).
+Avant toute installation, valider que la VM respecte le dimensionnement retenu : Nextcloud, PHP-FPM, Redis *et PostgreSQL* tournent sur la même machine, pour 10 à 20 utilisateurs simultanés au maximum.
 
-```bash
+{code:language=bash|title=Contrôles de la VM}
 # CPU : nombre de coeurs
 nproc
 lscpu | grep -E '^CPU\(s\)|Model name'
@@ -18,54 +21,58 @@ free -h
 df -h
 lsblk
 
+# Volumes dédiés (après préparation, cf. sections 4 et 10)
+findmnt /var/lib/pgsql
+findmnt /srv/backup
+
 # Version exacte de l'OS
 cat /etc/redhat-release
 uname -r
 
 # Architecture (64 bits attendu)
 uname -m
-```
+{code}
 
-| Ressource | Minimum attendu | Commande de vérification |
-| --- | --- | --- |
-| CPU | 4 vCPU | `nproc` |
-| RAM | 8 Go | `free -h` |
-| Disque système | 60 Go | `df -h /` |
-| OS | RHEL 9.8, 64 bits | `cat /etc/redhat-release` + `uname -m` |
+||Ressource||Minimum attendu||Commande de vérification||
+|CPU|4 vCPU|{{nproc}}|
+|RAM|8 Go|{{free -h}}|
+|Disque système|60 Go|{{df -h /}}|
+|Volume PostgreSQL|Volume SSD dédié monté sur {{/var/lib/pgsql}} (≥ 20 Go)|{{findmnt /var/lib/pgsql}}|
+|Volume sauvegardes BDD|Montage dédié, idéalement hors VM (NFS, cible de backup)|{{findmnt /srv/backup}}|
+|OS|RHEL 9.8, 64 bits|{{cat /etc/redhat-release}} et {{uname -m}}|
 
-Si la VM est sous-dimensionnée, ajuster côté hyperviseur (vCPU/RAM à chaud si le pilote le permet, sinon extinction + resize) avant de poursuivre.
+Budget mémoire estimé : OS ≈ 1 Go, PHP-FPM ≈ 2 Go, PostgreSQL ≈ 1,2 Go, Redis ≈ 0,2 Go, soit environ 4,5 Go ; le reste sert de cache disque. Si la VM swappe lors du test « Mémoire sous charge » de la recette, passer à 10 ou 12 Go côté hyperviseur (à chaud si le pilote le permet, sinon extinction + resize).
 
-## 1. Prérequis
+h1. 1. Prérequis
 
-Avant de commencer, réunissez les éléments suivants.
+Avant de commencer, réunir les éléments suivants.
 
-**Machine RHEL**
+*Machine RHEL*
+* RHEL 9.8, abonnement Red Hat Subscription Manager actif (pour les dépôts BaseOS/AppStream)
+* Dimensionnement : 4 vCPU / 8 Go RAM / 60 Go disque système, un volume SSD dédié à PostgreSQL, et un volume de données utilisateurs dimensionné selon les volumes SFS attendus
+* Accès root ou sudo
+* Un nom de domaine ou enregistrement DNS pointant vers le serveur (ex. {{cloud.moncabinet.fr}})
 
-- RHEL 9.8, abonnement Red Hat Subscription Manager actif (pour les dépôts BaseOS/AppStream)
-- Minimum recommandé : 4 vCPU / 8 Go RAM / 60 Go disque système (hors volume de données utilisateurs, à dimensionner selon les volumes SFS attendus)
-- Accès root ou sudo
-- Un nom de domaine ou enregistrement DNS pointant vers le serveur (ex. `cloud.moncabinet.fr`)
+*Base de données PostgreSQL locale*
+* PostgreSQL installé sur la VM Nextcloud elle-même, depuis les dépôts AppStream RHEL (section 4) : plus de serveur BDD séparé, plus de flux réseau 5432 à demander
+* Un disque dédié présenté à la VM avant l'installation, pour {{/var/lib/pgsql}}
+* Un emplacement de sauvegarde, idéalement hors de la VM : l'exploitation de la base (sauvegardes, mises à jour, supervision) revient désormais à l'équipe qui opère Nextcloud
 
-**Base de données déportée**
+*Licence Nextcloud Enterprise*
+* Un compte client sur le portail Nextcloud GmbH avec les identifiants de subscription ({{subscription key}}), pour télécharger l'archive Enterprise et activer l'app {{support}}
+* L'archive {{nextcloud-enterprise-<version>.zip}} téléchargée depuis le portail sur le poste d'administration (cf. section 6)
 
-- Un serveur PostgreSQL (14 à 18) déjà installé sur une machine séparée
-- Adresse IP/FQDN, port, et un compte disposant des droits `CREATE DATABASE`/`CREATE USER` (ou une base et un utilisateur déjà provisionnés par l'équipe DBA)
-- Le flux réseau TCP 5432 (PostgreSQL) doit être ouvert entre le serveur Nextcloud et le serveur de BDD (pare-feu réseau + firewalld côté BDD)
+*Rappel des décisions d'architecture déjà actées*
+* Chiffrement côté serveur en mode *Master Key* (compatible SSO)
+* Redis pour le cache mémoire et le verrouillage de fichiers
+* PostgreSQL en local sur la VM, en écoute sur localhost uniquement
+* Dimensionnement : 4 vCPU / 8 Go RAM pour 10 à 20 utilisateurs simultanés, plus un volume PostgreSQL dédié
+* Pas d'antivirus sur les dépôts (ClamAV retiré du périmètre)
+* HTTPS obligatoire, certificat installé directement sur Apache (section 8)
 
-**Licence Nextcloud Enterprise**
+h1. 2. Préparation du système RHEL 9.8
 
-- Un compte client sur le portail Nextcloud GmbH avec les identifiants de subscription (`subscription key`) pour accéder au dépôt `enterprise` et activer l'app `Enterprise Bundle` / `support`
-
-**Rappel de vos décisions d'architecture déjà actées**
-
-- Chiffrement côté serveur en mode **Master Key** (compatible SSO)
-- Redis pour le cache mémoire et le verrouillage de fichiers (`file_locking.enabled`)
-- ClamAV pour l'analyse antivirus des dépôts
-- Dimensionnement de base : 4 vCPU / 8 Go RAM
-
-## 2. Préparation du système RHEL 9.8
-
-```bash
+{code:language=bash|title=Mise à jour et utilitaires}
 # Mise à jour complète du système
 sudo dnf update -y
 sudo reboot
@@ -75,33 +82,33 @@ subscription-manager status
 sudo dnf repolist
 
 # Utilitaires de base
-sudo dnf install -y wget curl tar bzip2 vim policycoreutils-python-utils chrony
+sudo dnf install -y wget curl tar bzip2 unzip vim policycoreutils-python-utils chrony
 
 # Synchronisation horaire (important pour TOTP/2FA et les jetons de session)
 sudo systemctl enable --now chronyd
 timedatectl set-timezone Europe/Paris
-```
+{code}
 
-**Firewalld** (le pare-feu local ; le flux vers la BDD distante doit en plus être ouvert au niveau réseau) :
+*Firewalld* (pare-feu local ; la BDD étant locale, aucun port PostgreSQL n'est à ouvrir) :
 
-```bash
+{code:language=bash}
 sudo systemctl enable --now firewalld
 sudo firewall-cmd --permanent --add-service=http
 sudo firewall-cmd --permanent --add-service=https
 sudo firewall-cmd --reload
-```
+{code}
 
-**SELinux** : le laisser en mode `enforcing` (recommandé) — les règles spécifiques à Nextcloud sont posées en section 7. Vérifier l'état :
+*SELinux* : le laisser en mode {{enforcing}} (recommandé) ; les règles spécifiques à Nextcloud sont posées en section 7. Vérifier l'état :
 
-```bash
+{code:language=bash}
 getenforce
-```
+{code}
 
-## 3. Apache, PHP 8.3 et modules requis
+h1. 3. Apache, PHP 8.3 et modules requis
 
-RHEL 9.8 fournit PHP 8.1 via AppStream, trop ancien pour Nextcloud (8.3 minimum, 8.4 recommandé). On utilise le module **Remi** qui fournit PHP 8.3/8.4 packagé pour RHEL.
+RHEL 9.8 fournit PHP 8.1 via AppStream, trop ancien pour Nextcloud (8.3 minimum, 8.4 recommandé). On utilise le dépôt *Remi*, qui fournit PHP 8.3/8.4 packagé pour RHEL.
 
-```bash
+{code:language=bash|title=Apache et PHP}
 # Apache
 sudo dnf install -y httpd mod_ssl
 sudo systemctl enable --now httpd
@@ -116,18 +123,18 @@ sudo dnf module enable php:remi-8.3 -y
 sudo dnf install -y php php-cli php-fpm php-pgsql php-gd php-mbstring \
   php-intl php-bcmath php-gmp php-curl php-xml php-zip php-opcache php-apcu \
   php-redis php-ldap php-imagick php-pecl-smbclient
-```
+{code}
 
-Activer PHP-FPM et le lier à Apache (mod\_php n'est pas packagé par Remi pour PHP 8.3+, on passe donc en php-fpm) :
+Activer PHP-FPM et le lier à Apache (mod_php n'est pas packagé par Remi pour PHP 8.3+, on passe donc par php-fpm) :
 
-```bash
+{code:language=bash}
 sudo systemctl enable --now php-fpm
 sudo dnf install -y mod_php || true   # ignorer si absent : on utilisera proxy_fcgi
-```
+{code}
 
-Sur RHEL, la configuration Apache se trouve dans `/etc/httpd/conf.d/`. Créer `/etc/httpd/conf.d/nextcloud.conf` :
+Sur RHEL, la configuration Apache se trouve dans {{/etc/httpd/conf.d/}}. Créer {{/etc/httpd/conf.d/nextcloud.conf}} :
 
-```apache
+{code:language=none|title=/etc/httpd/conf.d/nextcloud.conf}
 <VirtualHost *:80>
   ServerName cloud.moncabinet.fr
   DocumentRoot /var/www/html/nextcloud/
@@ -145,113 +152,231 @@ Sur RHEL, la configuration Apache se trouve dans `/etc/httpd/conf.d/`. Créer `/
     SetHandler "proxy:unix:/run/php-fpm/www.sock|fcgi://localhost"
   </FilesMatch>
 </VirtualHost>
-```
+{code}
 
-```bash
+{code:language=bash}
 sudo a2enmod rewrite headers env dir mime 2>/dev/null || sudo dnf install -y mod_rewrite 2>/dev/null
 sudo systemctl restart httpd php-fpm
-```
+{code}
 
-> Sur RHEL, la plupart des modules Apache (`rewrite`, `headers`, `env`, `dir`, `mime`) sont déjà chargés par défaut avec `httpd` — pas d'équivalent `a2enmod` ; vérifier avec `httpd -M | grep -E 'rewrite|headers|proxy_fcgi'`.
+{note}
+Sur RHEL, la plupart des modules Apache (rewrite, headers, env, dir, mime) sont déjà chargés par défaut avec httpd ; il n'y a pas d'équivalent à a2enmod. Vérifier avec : {{httpd -M | grep -E 'rewrite|headers|proxy_fcgi'}}
+{note}
 
-## 4. Base de données déportée
+h1. 4. Base de données PostgreSQL locale
 
-La base tourne sur un serveur séparé : toute la configuration ci-dessous s'exécute **sur le serveur de BDD**, sauf le test de connectivité final.
+La base tourne sur la même VM que Nextcloud et n'écoute que sur localhost : aucun port à ouvrir, aucun flux réseau à demander. Toutes les commandes ci-dessous s'exécutent sur la VM Nextcloud.
 
-### Configuration PostgreSQL
+h2. Volume dédié pour les données PostgreSQL
 
-```sql
+À faire *avant* l'installation du paquet, pour que {{/var/lib/pgsql}} soit sur son propre disque (isolation des I/O et de l'espace disque vis-à-vis des fichiers utilisateurs).
+
+{code:language=bash}
+# Exemple avec un disque /dev/sdb dédié : adapter au nom réel vu dans lsblk
+sudo pvcreate /dev/sdb
+sudo vgcreate vg_pgsql /dev/sdb
+sudo lvcreate -l 100%FREE -n lv_pgsql vg_pgsql
+sudo mkfs.xfs /dev/vg_pgsql/lv_pgsql
+
+sudo mkdir -p /var/lib/pgsql
+echo '/dev/vg_pgsql/lv_pgsql  /var/lib/pgsql  xfs  defaults,noatime  0 0' | sudo tee -a /etc/fstab
+sudo systemctl daemon-reload
+sudo mount /var/lib/pgsql
+{code}
+
+h2. Installation de PostgreSQL
+
+{code:language=bash}
+# Versions disponibles dans AppStream
+sudo dnf module list postgresql
+
+# Activer la 16 (maintenue par Red Hat, supportée par Nextcloud)
+sudo dnf module enable -y postgresql:16
+sudo dnf install -y postgresql-server postgresql-contrib
+
+# Droits et contexte SELinux sur le volume monté
+sudo chown postgres:postgres /var/lib/pgsql
+sudo chmod 700 /var/lib/pgsql
+sudo restorecon -Rv /var/lib/pgsql
+
+# Initialisation du cluster et démarrage
+sudo postgresql-setup --initdb
+sudo systemctl enable --now postgresql
+{code}
+
+h2. Base et utilisateur applicatif
+
+{code:language=bash}
+sudo -u postgres psql <<'EOF'
 CREATE USER nextcloud WITH PASSWORD 'MOT_DE_PASSE_FORT';
 CREATE DATABASE nextcloud OWNER nextcloud ENCODING 'UTF8' TEMPLATE template0;
-```
+EOF
+{code}
 
-Dans `pg_hba.conf`, autoriser l'IP du serveur Nextcloud, et dans `postgresql.conf` : `listen_addresses = '*'`, puis :
+h2. Écoute et authentification
 
-```bash
+Dans {{/var/lib/pgsql/data/postgresql.conf}} :
+
+{code:language=none}
+listen_addresses = 'localhost'
+password_encryption = scram-sha-256
+{code}
+
+Dans {{/var/lib/pgsql/data/pg_hba.conf}}, ajouter ces lignes *au-dessus* des règles par défaut (la première règle qui correspond l'emporte, et RHEL met {{ident}} par défaut sur 127.0.0.1) :
+
+{code:language=none}
+# TYPE  DATABASE   USER       ADDRESS        METHOD
+host    nextcloud  nextcloud  127.0.0.1/32   scram-sha-256
+host    nextcloud  nextcloud  ::1/128        scram-sha-256
+{code}
+
+h2. Réglages mémoire (VM 8 Go)
+
+Toujours dans {{postgresql.conf}} :
+
+{code:language=none}
+shared_buffers = 1GB
+effective_cache_size = 3GB
+work_mem = 8MB
+maintenance_work_mem = 256MB
+max_connections = 50
+wal_buffers = 16MB
+checkpoint_completion_target = 0.9
+random_page_cost = 1.1            # volume SSD
+effective_io_concurrency = 200    # volume SSD
+{code}
+
+Valeurs calibrées pour 10 à 20 utilisateurs simultanés. {{max_connections}} doit rester supérieur à {{pm.max_children}} de PHP-FPM (section 9), avec une marge pour le cron et les commandes occ. Si la VM passe à 12 Go, monter à {{shared_buffers = 1536MB}} et {{effective_cache_size = 5GB}}.
+
+h2. Application et test
+
+{code:language=bash}
 sudo systemctl restart postgresql
-sudo firewall-cmd --permanent --add-port=5432/tcp
-sudo firewall-cmd --reload
-```
 
-### Test de connectivité (depuis le serveur Nextcloud)
+# Doit écouter uniquement sur 127.0.0.1 et ::1
+sudo ss -tlnp 'sport = :5432'
 
-```bash
-psql -h <IP_BDD> -U nextcloud -d nextcloud
-```
+# Test d'authentification du compte applicatif (mot de passe demandé)
+psql -h 127.0.0.1 -U nextcloud -d nextcloud -c 'SELECT version();'
+{code}
 
-Si la connexion échoue, vérifier dans l'ordre : pare-feu réseau entre les deux VLAN, `firewall-cmd` côté BDD, `listen_addresses`, puis les droits `GRANT`/`pg_hba.conf`.
+Ne *pas* ajouter de règle firewalld pour le port 5432 : il n'a aucune raison d'être exposé. Si la connexion échoue, vérifier dans l'ordre : service démarré ({{systemctl status postgresql}}), ordre des lignes dans {{pg_hba.conf}}, puis le mot de passe ({{ALTER USER nextcloud WITH PASSWORD ...}} pour le réinitialiser).
 
-## 5. Redis (cache et verrouillage de fichiers)
+h1. 5. Redis (cache et verrouillage de fichiers)
 
-```bash
+{code:language=bash}
 sudo dnf install -y redis
 sudo systemctl enable --now redis
-```
+{code}
 
-Dans `/etc/redis/redis.conf`, sécuriser l'accès local :
+Dans {{/etc/redis/redis.conf}}, sécuriser l'accès local :
 
-```ini
+{code:language=none}
 unixsocket /var/run/redis/redis.sock
 unixsocketperm 770
 requirepass MOT_DE_PASSE_REDIS
-```
+{code}
 
-```bash
+{code:language=bash}
 sudo usermod -a -G redis apache
 sudo systemctl restart redis
-```
+{code}
 
-La déclaration dans `config.php` (mémoire cache **et** verrouillage de fichiers) est faite en section 8 une fois Nextcloud installé.
+La déclaration dans {{config.php}} (mémoire cache *et* verrouillage de fichiers) est faite en section 9, une fois Nextcloud installé.
 
-## 6. Téléchargement et installation de Nextcloud Enterprise Edition
+h1. 6. Téléchargement et installation de Nextcloud Enterprise Edition
 
-L'archive EE n'est pas sur le dépôt public : elle se télécharge depuis le portail client Nextcloud GmbH avec vos identifiants de subscription, ou via l'URL signée fournie dans votre espace client.
+L'archive EE n'est pas sur le dépôt public : l'archive .zip se télécharge depuis le portail client Nextcloud GmbH (identifiants de subscription), sur le poste d'administration, puis elle est déposée sur la VM. La VM n'a donc besoin d'aucun accès sortant vers les serveurs Nextcloud pour l'installation.
 
-```bash
+h2. 6.1 Sur le poste d'administration
+
+Télécharger {{nextcloud-enterprise-<version>.zip}} depuis le portail, et relever l'empreinte SHA-256 publiée à côté si elle est fournie.
+
+{code:language=bash}
+# macOS : calcul de l'empreinte, à comparer avec celle du portail
+shasum -a 256 nextcloud-enterprise-<version>.zip
+{code}
+
+h2. 6.2 Dépôt sur la VM
+
+Copier le zip dans {{/tmp}} de la VM par le canal de transfert autorisé (SFTP/SCP via CyberArk, ou outil de transfert habituel). Exemple en SCP direct :
+
+{code:language=bash}
+scp nextcloud-enterprise-<version>.zip <compte>@<vm-nextcloud>:/tmp/
+{code}
+
+h2. 6.3 Sur la VM : contrôle, décompression, mise en place
+
+{code:language=bash}
+sudo dnf install -y unzip
 cd /tmp
-# Remplacer par l'URL exacte fournie par votre espace client Nextcloud GmbH
-wget "https://portal.nextcloud.com/customer/download/enterprise/nextcloud-enterprise-<version>.tar.bz2"
-tar -xjf nextcloud-enterprise-<version>.tar.bz2
+
+# Même empreinte que sur le poste : le fichier n'a pas été altéré pendant le transfert
+sha256sum nextcloud-enterprise-<version>.zip
+
+# L'archive doit contenir un dossier racine nextcloud/
+unzip -l nextcloud-enterprise-<version>.zip | head
+
+unzip -q nextcloud-enterprise-<version>.zip
 sudo mv nextcloud /var/www/html/nextcloud
 sudo chown -R apache:apache /var/www/html/nextcloud
 sudo chmod -R 750 /var/www/html/nextcloud
-```
 
-**Répertoire de données** (à part du webroot, idéalement sur un volume dédié) :
+# Ménage
+rm -f /tmp/nextcloud-enterprise-<version>.zip
+{code}
 
-```bash
+{note}
+Le dossier déplacé depuis /tmp garde un contexte SELinux user_tmp_t : c'est normal à ce stade, le restorecon de la section 7 le corrige. Tant que la section 7 n'est pas faite, Apache peut renvoyer des erreurs 403 sur le webroot.
+{note}
+
+h2. 6.4 Répertoire de données
+
+À part du webroot, idéalement sur un volume dédié :
+
+{code:language=bash}
 sudo mkdir -p /srv/nextcloud-data
 sudo chown apache:apache /srv/nextcloud-data
-```
+{code}
 
-**Installation en ligne de commande** (`occ`), avec la BDD déportée :
+h2. 6.5 Installation en ligne de commande (occ)
 
-```bash
+Avec la BDD locale :
+
+{code:language=bash}
 sudo -u apache php /var/www/html/nextcloud/occ maintenance:install \
   --database "pgsql" \
-  --database-host "<IP_ou_FQDN_BDD>:5432" \
+  --database-host "127.0.0.1:5432" \
   --database-name "nextcloud" \
   --database-user "nextcloud" \
   --database-pass "MOT_DE_PASSE_FORT" \
   --data-dir "/srv/nextcloud-data" \
   --admin-user "admin" \
   --admin-pass "MOT_DE_PASSE_ADMIN"
-```
 
-**Application de la clé de subscription Enterprise** :
+# Index et réparations recommandés après l'installation
+sudo -u apache php /var/www/html/nextcloud/occ db:add-missing-indices
+sudo -u apache php /var/www/html/nextcloud/occ maintenance:repair --include-expensive
+{code}
 
-```bash
+{info}
+On passe par TCP sur 127.0.0.1 plutôt que par socket Unix : la règle pg_hba.conf reste simple, SELinux n'a rien de plus à autoriser, et le surcoût est négligeable en local.
+{info}
+
+h2. 6.6 Application de la clé de subscription Enterprise
+
+{code:language=bash}
 sudo -u apache php /var/www/html/nextcloud/occ config:system:set license-key --value="VOTRE_CLE_DE_SOUSCRIPTION"
 sudo -u apache php /var/www/html/nextcloud/occ app:enable support
-```
+{code}
 
-Vérifier que le statut d'abonnement est bien reconnu dans **Administration > Aperçu** une fois connecté.
+Vérifier que le statut d'abonnement est bien reconnu dans *Administration > Aperçu* une fois connecté.
 
-## 7. SELinux, pare-feu et SSL/TLS
+h1. 7. SELinux et pare-feu
 
-### SELinux
+h2. SELinux
 
-```bash
+{code:language=bash}
 sudo dnf install -y policycoreutils-python-utils
 
 # Contextes sur le webroot et le répertoire de données
@@ -259,47 +384,206 @@ sudo semanage fcontext -a -t httpd_sys_rw_content_t "/var/www/html/nextcloud(/.*
 sudo semanage fcontext -a -t httpd_sys_rw_content_t "/srv/nextcloud-data(/.*)?"
 sudo restorecon -Rv /var/www/html/nextcloud /srv/nextcloud-data
 
-# Autoriser Apache à ouvrir des connexions réseau sortantes (BDD déportée, Redis distant, fédération)
-sudo setsebool -P httpd_can_network_connect on
+# Apache -> PostgreSQL local en TCP (127.0.0.1:5432)
 sudo setsebool -P httpd_can_network_connect_db on
-```
 
-En cas de blocage inattendu, consulter `/var/log/audit/audit.log` et générer un module dédié avec `audit2allow` plutôt que de désactiver SELinux.
+# Apache -> connexions sortantes (App Store, fédération, SMTP)
+sudo setsebool -P httpd_can_network_connect on
 
-### Pare-feu
+# Contrôle : le volume PostgreSQL garde son contexte postgresql_db_t
+ls -Zd /var/lib/pgsql/data
+{code}
 
-```bash
+En cas de blocage inattendu, consulter {{/var/log/audit/audit.log}} et générer un module dédié avec {{audit2allow}} plutôt que de désactiver SELinux.
+
+h2. Pare-feu
+
+{code:language=bash}
 sudo firewall-cmd --permanent --add-service=http
 sudo firewall-cmd --permanent --add-service=https
 sudo firewall-cmd --reload
-```
+{code}
 
-(le port de la BDD distante a déjà été ouvert côté serveur BDD en section 4 — rien à ouvrir en entrée ici, seulement en sortie, généralement déjà autorisé par défaut sur firewalld).
+Seuls HTTP et HTTPS sont exposés. PostgreSQL n'écoute que sur localhost : aucun port BDD à ouvrir, ni en entrée ni au niveau du pare-feu réseau.
 
-### SSL/TLS
+h1. 8. Certificat HTTPS
 
-Avec Let's Encrypt (accès Internet direct au serveur) :
+HTTPS est indispensable : les clients desktop et mobiles, les cookies de session et les partages avec les partenaires en dépendent. Le cas nominal ci-dessous est un certificat émis par la *PKI interne ou une autorité commerciale*, installé directement sur Apache. Deux variantes suivent : Let's Encrypt, et TLS terminé sur un reverse-proxy existant.
 
-```bash
+Les fichiers sont rangés dans {{/etc/pki/tls/}}, qui porte déjà le bon contexte SELinux ({{cert_t}}) : rien à ajouter côté SELinux tant qu'on reste dans cette arborescence.
+
+||Fichier||Emplacement||
+|Clé privée|{{/etc/pki/tls/private/cloud.moncabinet.fr.key}}|
+|Demande de certificat (CSR)|{{/etc/pki/tls/private/cloud.moncabinet.fr.csr}}|
+|Certificat serveur|{{/etc/pki/tls/certs/cloud.moncabinet.fr.crt}}|
+|Chaîne intermédiaire|{{/etc/pki/tls/certs/cloud.moncabinet.fr-chain.crt}}|
+|Certificat + chaîne (utilisé par Apache)|{{/etc/pki/tls/certs/cloud.moncabinet.fr-fullchain.crt}}|
+
+h2. 8.1 Générer la clé privée et la CSR
+
+{code:language=bash}
+sudo openssl req -new -newkey rsa:3072 -nodes \
+  -keyout /etc/pki/tls/private/cloud.moncabinet.fr.key \
+  -out /etc/pki/tls/private/cloud.moncabinet.fr.csr \
+  -subj "/C=FR/O=MonCabinet/CN=cloud.moncabinet.fr" \
+  -addext "subjectAltName=DNS:cloud.moncabinet.fr"
+
+sudo chmod 600 /etc/pki/tls/private/cloud.moncabinet.fr.key
+
+# Contrôle : le SAN doit contenir le FQDN (les navigateurs ignorent le CN seul)
+sudo openssl req -in /etc/pki/tls/private/cloud.moncabinet.fr.csr -noout -text | grep -A1 'Subject Alternative Name'
+{code}
+
+Transmettre le fichier .csr (jamais la clé) à l'équipe PKI ou à l'autorité de certification. Demander en retour le certificat serveur *et* la chaîne intermédiaire, au format PEM.
+
+h2. 8.2 Installer le certificat reçu
+
+Si l'autorité fournit un fichier .pfx / .p12, en extraire d'abord les éléments :
+
+{code:language=bash}
+openssl pkcs12 -in certificat.pfx -clcerts -nokeys -out cloud.moncabinet.fr.crt
+openssl pkcs12 -in certificat.pfx -cacerts -nokeys -out cloud.moncabinet.fr-chain.crt
+# Uniquement si la clé a été générée par l'autorité et non par la CSR ci-dessus
+openssl pkcs12 -in certificat.pfx -nocerts -nodes -out cloud.moncabinet.fr.key
+{code}
+
+Puis installer et vérifier :
+
+{code:language=bash}
+sudo cp cloud.moncabinet.fr.crt cloud.moncabinet.fr-chain.crt /etc/pki/tls/certs/
+cd /etc/pki/tls/certs
+sudo sh -c 'cat cloud.moncabinet.fr.crt cloud.moncabinet.fr-chain.crt > cloud.moncabinet.fr-fullchain.crt'
+sudo chmod 644 cloud.moncabinet.fr*.crt
+sudo restorecon -Rv /etc/pki/tls
+
+# La clé et le certificat doivent correspondre (les deux empreintes doivent être identiques)
+sudo openssl x509 -in cloud.moncabinet.fr.crt -noout -pubkey | sha256sum
+sudo openssl pkey -in /etc/pki/tls/private/cloud.moncabinet.fr.key -pubout | sha256sum
+
+# La chaîne doit valider le certificat
+openssl verify -untrusted cloud.moncabinet.fr-chain.crt cloud.moncabinet.fr.crt
+
+# Dates de validité et SAN
+openssl x509 -in cloud.moncabinet.fr.crt -noout -dates -ext subjectAltName
+{code}
+
+{note}
+Avec une PKI interne, openssl verify ne répond OK que si la CA racine est connue du serveur : la déposer dans /etc/pki/ca-trust/source/anchors/ puis lancer sudo update-ca-trust. Les postes des utilisateurs et des partenaires doivent aussi faire confiance à cette racine ; sinon, privilégier un certificat d'une autorité publique pour un service ouvert aux partenaires externes.
+{note}
+
+h2. 8.3 Configuration Apache en HTTPS
+
+Remplacer {{/etc/httpd/conf.d/nextcloud.conf}} (créé en section 3) par :
+
+{code:language=none|title=/etc/httpd/conf.d/nextcloud.conf}
+<VirtualHost *:80>
+  ServerName cloud.moncabinet.fr
+  RewriteEngine On
+  RewriteRule ^/?(.*) https://%{SERVER_NAME}/$1 [R=301,L]
+</VirtualHost>
+
+<VirtualHost *:443>
+  ServerName cloud.moncabinet.fr
+  DocumentRoot /var/www/html/nextcloud/
+
+  SSLEngine on
+  SSLCertificateFile    /etc/pki/tls/certs/cloud.moncabinet.fr-fullchain.crt
+  SSLCertificateKeyFile /etc/pki/tls/private/cloud.moncabinet.fr.key
+
+  # Recommandé par Nextcloud (6 mois) ; à n'activer qu'une fois le certificat validé
+  Header always set Strict-Transport-Security "max-age=15552000; includeSubDomains"
+
+  <Directory /var/www/html/nextcloud/>
+    Require all granted
+    AllowOverride All
+    Options FollowSymLinks MultiViews
+    <IfModule mod_dav.c>
+      Dav off
+    </IfModule>
+  </Directory>
+
+  <FilesMatch \.php$>
+    SetHandler "proxy:unix:/run/php-fpm/www.sock|fcgi://localhost"
+  </FilesMatch>
+</VirtualHost>
+{code}
+
+{code:language=bash}
+sudo apachectl configtest
+sudo systemctl reload httpd
+{code}
+
+Pas besoin de fixer SSLProtocol ni SSLCipherSuite : RHEL applique la politique cryptographique système ({{update-crypto-policies \-\-show}} renvoie DEFAULT, soit TLS 1.2 et 1.3 uniquement). Le vhost {{\_default\_:443}} livré dans {{ssl.conf}} peut rester : Apache sélectionne le bon vhost par SNI grâce au ServerName.
+
+h2. 8.4 Déclarer l'URL HTTPS dans Nextcloud
+
+{code:language=bash}
+sudo -u apache php /var/www/html/nextcloud/occ config:system:set overwrite.cli.url --value="https://cloud.moncabinet.fr"
+{code}
+
+Cette valeur sert aux liens générés hors requête web (notifications, cron, liens de partage envoyés par e-mail).
+
+h2. 8.5 Variante : Let's Encrypt
+
+Uniquement si le serveur est joignable depuis Internet sur le port 80 avec un DNS public (validation HTTP-01). À la place des étapes 8.1 à 8.3 :
+
+{code:language=bash}
+# certbot vient d'EPEL, déjà ajouté en section 3
 sudo dnf install -y certbot python3-certbot-apache
-sudo certbot --apache -d cloud.moncabinet.fr
-```
+sudo certbot --apache -d cloud.moncabinet.fr --redirect
 
-Si le serveur n'est pas exposé directement sur Internet (cas fréquent pour un partage SFS interne/partenaires), utiliser un certificat émis par votre PKI interne ou un reverse-proxy existant, et forcer `overwrite.protocol => 'https'` dans `config.php` si le TLS est terminé en amont.
+# Renouvellement automatique : vérifier le timer et tester
+systemctl list-timers | grep certbot
+sudo certbot renew --dry-run
+{code}
 
-## 8. Réglages finaux
+h2. 8.6 Variante : TLS terminé sur un reverse-proxy
 
-### Domaines de confiance et proxy éventuel
+Si un reverse-proxy ou un load-balancer existant porte le certificat, Apache reste en HTTP sur le réseau interne et Nextcloud doit connaître le proxy :
 
-```bash
+{code:language=bash}
+OCC="sudo -u apache php /var/www/html/nextcloud/occ"
+$OCC config:system:set trusted_proxies 0 --value="<IP_DU_PROXY>"
+$OCC config:system:set overwriteprotocol --value="https"
+$OCC config:system:set overwrite.cli.url --value="https://cloud.moncabinet.fr"
+$OCC config:system:set forwarded_for_headers 0 --value="HTTP_X_FORWARDED_FOR"
+{code}
+
+L'en-tête HSTS se pose alors sur le proxy, pas sur Apache.
+
+h2. 8.7 Renouvellement et surveillance de l'expiration
+
+Un certificat PKI ou commercial dure en général un an et ne se renouvelle pas tout seul. Script d'alerte à 30 jours, qui écrit dans le journal système (à raccorder à la supervision) :
+
+{code:language=bash}
+sudo tee /usr/local/bin/check-cert-expiry.sh > /dev/null <<'EOF'
+#!/bin/bash
+CERT=/etc/pki/tls/certs/cloud.moncabinet.fr.crt
+SEUIL_JOURS=30
+if ! openssl x509 -in "$CERT" -noout -checkend $((SEUIL_JOURS * 86400)) > /dev/null; then
+  logger -t cert-expiry -p user.warning \
+    "Certificat $CERT expire dans moins de $SEUIL_JOURS jours ($(openssl x509 -in "$CERT" -noout -enddate))"
+fi
+EOF
+sudo chmod 755 /usr/local/bin/check-cert-expiry.sh
+echo '0 8 * * * root /usr/local/bin/check-cert-expiry.sh' | sudo tee /etc/cron.d/check-cert-expiry
+{code}
+
+Procédure de renouvellement, sans interruption de service : générer une nouvelle CSR (8.1), installer le nouveau certificat et reconstruire le fullchain (8.2), puis {{apachectl configtest}} et {{systemctl reload httpd}}.
+
+h1. 9. Réglages finaux
+
+h2. Domaines de confiance
+
+{code:language=bash}
 sudo -u apache php /var/www/html/nextcloud/occ config:system:set trusted_domains 1 --value="cloud.moncabinet.fr"
-```
+{code}
 
-### Redis — cache mémoire et verrouillage de fichiers
+h2. Redis : cache mémoire et verrouillage de fichiers
 
-Dans `/var/www/html/nextcloud/config/config.php` :
+Dans {{/var/www/html/nextcloud/config/config.php}} :
 
-```php
+{code:language=php}
 'memcache.local' => '\\OC\\Memcache\\APCu',
 'memcache.locking' => '\\OC\\Memcache\\Redis',
 'memcache.distributed' => '\\OC\\Memcache\\Redis',
@@ -309,66 +593,148 @@ Dans `/var/www/html/nextcloud/config/config.php` :
     'password' => 'MOT_DE_PASSE_REDIS',
 ],
 'filelocking.enabled' => true,
-```
+{code}
 
-### Chiffrement — mode Master Key
+h2. Chiffrement : mode Master Key
 
-```bash
+{code:language=bash}
 sudo -u apache php /var/www/html/nextcloud/occ app:enable encryption
 sudo -u apache php /var/www/html/nextcloud/occ encryption:enable
 sudo -u apache php /var/www/html/nextcloud/occ encryption:select-encryption-type masterkey
 sudo -u apache php /var/www/html/nextcloud/occ encryption:encrypt-all
-```
+{code}
 
-### ClamAV (antivirus des dépôts)
+h2. Tâches planifiées (cron)
 
-```bash
-sudo dnf install -y clamav clamav-update clamd
-sudo freshclam
-sudo systemctl enable --now clamd@scan
-```
-
-Installer l'app **Antivirus for files** depuis l'App Store Nextcloud puis, dans **Administration > Sécurité**, pointer le mode « Démon Clam AV » vers le socket `/run/clamd.scan/clamd.sock`.
-
-### Tâches planifiées (cron)
-
-```bash
+{code:language=bash}
 sudo -u apache php /var/www/html/nextcloud/occ background:cron
 (sudo crontab -u apache -l 2>/dev/null; echo "*/5 * * * * php -f /var/www/html/nextcloud/cron.php") | sudo crontab -u apache -
-```
+{code}
 
-### PHP — opcache et limites
+h2. PHP : opcache et limites
 
-Dans `/etc/php.d/10-opcache.ini` (ou équivalent Remi) :
+Dans {{/etc/php.d/10-opcache.ini}} (ou équivalent Remi) :
 
-```ini
+{code:language=none}
 opcache.enable=1
 opcache.interned_strings_buffer=16
 opcache.max_accelerated_files=10000
 opcache.memory_consumption=256
 opcache.save_comments=1
 opcache.revalidate_freq=60
-```
+{code}
 
-Dans `php.ini` : `memory_limit = 512M`, `upload_max_filesize`/`post_max_size` selon la taille des dépôts SFS attendue (ex. `10G` pour de gros transferts partenaires).
+Dans {{php.ini}} : {{memory_limit = 512M}}, {{upload_max_filesize}} et {{post_max_size}} selon la taille des dépôts SFS attendue (ex. {{10G}} pour de gros transferts partenaires).
 
-```bash
+{code:language=bash}
 sudo systemctl restart php-fpm httpd
-```
+{code}
 
-## 9. Cahier de recette (vérifications post-installation)
+h2. PHP-FPM : taille du pool
 
-| Test | Commande / action | Résultat attendu |
-| --- | --- | --- |
-| Diagnostic global | `occ check` puis Administration > Aperçu | Aucune alerte critique |
-| Connexion BDD déportée | Connexion web + `occ db:...` | Pas d'erreur, latence acceptable |
-| Redis actif | `occ config:list system \| grep -i redis` puis upload concurrent de 2 sessions | Pas de conflit de verrou fichier |
-| Chiffrement Master Key | `occ encryption:status` | `enabled: true`, `masterKeyEnabled: true` |
-| ClamAV | Uploader un fichier de test EICAR | Fichier rejeté/mis en quarantaine |
-| Cron | Administration > Réglages de base | Dernière exécution < 15 min |
-| SSL | `curl -vI https://cloud.moncabinet.fr` | Certificat valide, HTTP 200 |
-| SELinux | `sudo ausearch -m avc -ts recent` | Aucun déni pertinent |
-| Upload gros fichier | Upload > 1 Go via navigateur ou client desktop | Succès sans timeout |
-| Migration utilisateurs LDAP/locaux | À planifier séparément selon la stratégie retenue | — |
+Avec PostgreSQL sur la même VM, le pool PHP-FPM doit être borné pour ne pas affamer la base. Dans {{/etc/php-fpm.d/www.conf}} :
 
-> La ligne « Migration utilisateurs » reste ouverte : elle dépend du choix (comptes locaux vs LDAP) évoqué précédemment et n'est pas couverte par ce tutoriel d'installation.
+{code:language=none}
+pm = dynamic
+pm.max_children = 25
+pm.start_servers = 5
+pm.min_spare_servers = 3
+pm.max_spare_servers = 10
+pm.max_requests = 500
+{code}
+
+Compter environ 60 à 80 Mo par processus : 25 processus représentent 1,5 à 2 Go, largement de quoi servir 10 à 20 utilisateurs simultanés. Garder {{pm.max_children}} sous le {{max_connections}} de PostgreSQL (50).
+
+{code:language=bash}
+sudo systemctl restart php-fpm
+{code}
+
+h1. 10. Sauvegarde et exploitation de la base locale
+
+La base n'est plus sauvegardée par une équipe BDD : c'est à mettre en place dès l'installation. Une sauvegarde exploitable comprend *trois éléments cohérents entre eux* : le dump PostgreSQL, {{config.php}}, et le répertoire de données.
+
+{warning}
+En mode Master Key, perdre config.php (secret, passwordsalt) ou les clés sous /srv/nextcloud-data/files_encryption rend les fichiers illisibles.
+{warning}
+
+h2. Script de sauvegarde
+
+{code:language=bash|title=/usr/local/bin/nextcloud-db-backup.sh}
+#!/bin/bash
+set -euo pipefail
+
+BACKUP_DIR=/srv/backup/nextcloud-db
+RETENTION_DAYS=14
+STAMP=$(date +%Y%m%d-%H%M)
+
+mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
+
+# Dump au format custom (compressé, restauration sélective possible)
+runuser -u postgres -- pg_dump -Fc nextcloud > "$BACKUP_DIR/nextcloud-$STAMP.dump"
+
+# config.php (secret + passwordsalt indispensables au déchiffrement)
+cp /var/www/html/nextcloud/config/config.php "$BACKUP_DIR/config-$STAMP.php"
+chmod 600 "$BACKUP_DIR"/*-"$STAMP".*
+
+# Rétention
+find "$BACKUP_DIR" -type f -mtime +"$RETENTION_DAYS" -delete
+{code}
+
+{code:language=bash}
+sudo chmod 700 /usr/local/bin/nextcloud-db-backup.sh
+echo '30 1 * * * root /usr/local/bin/nextcloud-db-backup.sh >> /var/log/nextcloud-db-backup.log 2>&1' | sudo tee /etc/cron.d/nextcloud-db-backup
+{code}
+
+{{/srv/backup}} doit idéalement être un montage hors VM (NFS, cible de l'outil de sauvegarde), sinon une perte de la VM emporte la base *et* ses sauvegardes. Si les fichiers utilisateurs sont sauvegardés par snapshot, encadrer dump + snapshot par {{occ maintenance:mode \-\-on}} / {{\-\-off}} pour garantir la cohérence entre base et fichiers.
+
+h2. Restauration (à tester en recette, jamais directement en production)
+
+{code:language=bash}
+sudo -u apache php /var/www/html/nextcloud/occ maintenance:mode --on
+
+sudo -u postgres dropdb nextcloud
+sudo -u postgres createdb -O nextcloud -E UTF8 -T template0 nextcloud
+sudo sh -c 'runuser -u postgres -- pg_restore -d nextcloud --no-owner --role=nextcloud < /srv/backup/nextcloud-db/nextcloud-AAAAMMJJ-HHMM.dump'
+
+sudo -u apache php /var/www/html/nextcloud/occ maintenance:mode --off
+sudo -u apache php /var/www/html/nextcloud/occ maintenance:data-fingerprint
+{code}
+
+h2. Maintenance courante
+
+* *Mises à jour* : les versions mineures de PostgreSQL arrivent avec {{dnf update}} et s'intègrent au cycle de patching de la VM (redémarrage du service à prévoir). Un changement de version majeure (16 vers 17…) nécessite un {{pg_dump}}/{{pg_restore}} ou {{pg_upgrade}}, à planifier comme une opération à part.
+* *Supervision* : surveiller au minimum l'espace libre de {{/var/lib/pgsql}} et de {{/srv/backup}}, l'état du service postgresql, et le log {{/var/log/nextcloud-db-backup.log}}.
+* *Autovacuum* : actif par défaut, rien à régler au départ ; vérifier ponctuellement les grosses tables (oc\_filecache, oc\_activity) avec la requête ci-dessous.
+
+{code:language=sql}
+SELECT relname, last_autovacuum FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 10;
+{code}
+
+h1. 11. Cahier de recette (vérifications post-installation)
+
+||Test||Commande / action||Résultat attendu||Statut||
+|Diagnostic global|{{occ check}} puis Administration > Aperçu|Aucune alerte critique (dont aucune alerte HTTPS/HSTS)| |
+|BDD locale utilisée|{{occ config:system:get dbhost}}|{{127.0.0.1:5432}}| |
+|PostgreSQL non exposé|{{ss -tlnp 'sport = :5432'}} et {{firewall-cmd \-\-list-all}}|Écoute sur 127.0.0.1 / ::1 uniquement, 5432 absent de firewalld| |
+|Réglages PostgreSQL appliqués|{{sudo -u postgres psql -c 'SHOW shared_buffers;'}}|{{1GB}}| |
+|Index BDD|{{occ db:add-missing-indices}}|Aucun index manquant| |
+|Mémoire sous charge|{{free -h}} pendant un upload > 1 Go avec plusieurs sessions ouvertes|Pas de swap significatif, pas d'OOM dans {{journalctl -k}}| |
+|Redis actif|{{occ config:system:get memcache.locking}} puis upload concurrent de 2 sessions|Redis déclaré, pas de conflit de verrou fichier| |
+|Chiffrement Master Key|{{occ encryption:status}}|{{enabled: true}}, {{masterKeyEnabled: true}}| |
+|Cron|Administration > Réglages de base|Dernière exécution < 15 min| |
+|Sauvegarde BDD|Lancer {{nextcloud-db-backup.sh}} à la main|Dump et {{config.php}} présents dans {{/srv/backup}}, taille > 0| |
+|Restauration BDD|Procédure section 10 sur l'environnement de recette|Nextcloud fonctionnel, fichiers chiffrés lisibles| |
+|HTTPS|{{curl -vI https://cloud.moncabinet.fr}} depuis un poste utilisateur|Certificat valide sans avertissement, HTTP 200| |
+|Redirection HTTP|{{curl -I http://cloud.moncabinet.fr}}|{{301}} vers https://| |
+|Chaîne de certificats|{{openssl s\_client -connect cloud.moncabinet.fr:443 -servername cloud.moncabinet.fr < /dev/null}}|Chaîne complète envoyée, {{Verify return code: 0 (ok)}}| |
+|HSTS|{{curl -sI https://cloud.moncabinet.fr}}|En-tête {{Strict-Transport-Security}} présent| |
+|Alerte d'expiration|Lancer {{check-cert-expiry.sh}} avec {{SEUIL\_JOURS=400}}|Message cert-expiry visible dans {{journalctl -t cert-expiry}}| |
+|Accès partenaire externe|Ouvrir un lien de partage depuis un poste hors du SI|Page chargée sans avertissement de certificat| |
+|SELinux|{{sudo ausearch -m avc -ts recent}}|Aucun déni pertinent (httpd ni postgresql)| |
+|Upload gros fichier|Upload > 1 Go via navigateur ou client desktop|Succès sans timeout| |
+|Migration utilisateurs LDAP/locaux|À planifier séparément selon la stratégie retenue|—| |
+
+{info}
+La ligne « Migration utilisateurs » reste ouverte : elle dépend du choix (comptes locaux ou LDAP) et n'est pas couverte par ce tutoriel d'installation.
+{info}
