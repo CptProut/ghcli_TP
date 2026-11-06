@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 #
 # Import d'utilisateurs Nextcloud via occ, a lancer sur la machine Nextcloud, en root.
-# Pas de mot de passe a gerer : l'utilisateur recoit un mail avec un lien pour choisir le sien.
+# Pas de mot de passe a gerer : l'utilisateur recoit, dans sa langue, un mail avec un lien
+# pour choisir le sien. Sans colonne language, le mail suit default_language.
 #
 # Usage : ./nc_import_occ.sh users.csv
 #
-# CSV en UTF-8, separateur ;, premiere ligne ignoree, colonnes dans cet ordre :
+# CSV en UTF-8, separateur ;, ligne d'en-tete facultative, colonnes dans cet ordre :
 #   userid;email;displayname;groups;quota;language
 # userid et email sont obligatoires. Plusieurs groupes : partenaires|finance
+# language : code Nextcloud (fr, en, de, es, it, nl, pt_BR...)
 
 # A adapter : utilisateur du serveur web et chemin de occ
-OCC=(sudo -u apache php /var/www/html/nextcloud/occ)
+NC_DIR=/var/www/html/nextcloud
+OCC=(sudo -u apache php "$NC_DIR/occ")
 
 CSV="${1:?Usage : $0 users.csv}"
 [ -f "$CSV" ] || { echo "Fichier introuvable : $CSV"; exit 1; }
@@ -18,18 +21,29 @@ CSV="${1:?Usage : $0 users.csv}"
 # </dev/null : sinon occ avale la suite du CSV et la boucle s'arrete au premier compte
 occ() { "${OCC[@]}" "$@" </dev/null 2>&1; }
 
-occ user:add --help | grep -q -- '--generate-password' ||
-    { echo "occ injoignable, ou version sans --generate-password : verifie OCC en haut du script"; exit 1; }
+occ user:add --help | grep -q -- '--generate-password' &&
+    occ user:welcome --help | grep -q -- '--reset-password' ||
+    { echo "occ injoignable, ou version trop ancienne : verifie NC_DIR et OCC en haut du script"; exit 1; }
 
+EMAIL_RE='^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
 ok=0 ignores=0 ko=0
 
 while IFS=';' read -r uid email name groups quota lang _ || [ -n "$uid" ]; do
-    [ -n "$uid$email" ] || continue
+    [ -n "$uid$email" ] && [ "$uid" != "userid" ] || continue
     if [ -z "$uid" ] || [ -z "$email" ]; then
         echo "KO      $uid $email : userid et email obligatoires"; ko=$((ko + 1)); continue
     fi
 
-    args=(--generate-password --email "$email")
+    # occ ne controle ni l'email ni la langue : on verifie avant de creer le compte
+    if ! [[ "$email" =~ $EMAIL_RE ]]; then
+        echo "KO      $uid : email invalide '$email'"; ko=$((ko + 1)); continue
+    fi
+    if [ -n "$lang" ] && [ "$lang" != "en" ] && [ ! -f "$NC_DIR/core/l10n/$lang.json" ]; then
+        echo "KO      $uid : langue inconnue '$lang'"; ko=$((ko + 1)); continue
+    fi
+
+    # Sans --email, user:add n'envoie rien : le mail part a la fin, une fois la langue reglee
+    args=(--generate-password)
     [ -z "$name" ] || args+=(--display-name "$name")
     IFS='|' read -r -a group_list <<< "$groups"
     for group in "${group_list[@]}"; do args+=(--group "$group"); done
@@ -39,17 +53,25 @@ while IFS=';' read -r uid email name groups quota lang _ || [ -n "$uid" ]; do
     case "$output" in
         *"already exists"*)
             echo "IGNORE  $uid : existe deja"; ignores=$((ignores + 1)); continue ;;
-        *"Welcome email sent"*)
-            echo "OK      $uid : cree, mail envoye"; ok=$((ok + 1)) ;;
-        *"was created successfully"*)
-            echo "KO      $uid : cree SANS mail : $(printf '%s' "$output" | tail -n 1)"; ko=$((ko + 1)) ;;
+        *"was created successfully"*) ;;
         *)
             echo "KO      $uid : $output"; ko=$((ko + 1)); continue ;;
     esac
 
+    if ! occ user:setting "$uid" settings email "$email" >/dev/null; then
+        echo "KO      $uid : cree, mais email non enregistre, donc pas de mail"; ko=$((ko + 1)); continue
+    fi
+    if [ -n "$lang" ]; then occ user:setting "$uid" core lang "$lang" >/dev/null || echo "        $uid : langue non appliquee"; fi
     if [ -n "$quota" ]; then occ user:setting "$uid" files quota "$quota" >/dev/null || echo "        $uid : quota non applique"; fi
-    if [ -n "$lang" ];  then occ user:setting "$uid" core lang "$lang" >/dev/null || echo "        $uid : langue non appliquee"; fi
-done < <(tail -n +2 "$CSV" | tr -d '\r')
+
+    if output=$(occ user:welcome --reset-password "$uid"); then
+        echo "OK      $uid : cree, mail envoye (${lang:-langue par defaut})"; ok=$((ok + 1))
+    else
+        echo "KO      $uid : cree SANS mail : $(printf '%s' "$output" | tail -n 1)"
+        echo "        Pour renvoyer : occ user:welcome --reset-password $uid"
+        ko=$((ko + 1))
+    fi
+done < <(sed '1s/^\xEF\xBB\xBF//' "$CSV" | tr -d '\r')
 
 echo
 echo "Termine : $ok cree(s), $ignores ignore(s), $ko en erreur"
