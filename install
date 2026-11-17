@@ -1,0 +1,600 @@
+# Installation Nextcloud — SFS Prod (NICSFS001)
+
+Nov 17, 2026 · @Capitaine
+
+## Contexte et choix d'installation
+
+Nextcloud Enterprise 34 s'installe depuis l'archive .zip sur NICSFS001, avec PostgreSQL 16 en local, Apache et PHP-FPM. Le code va dans `/var/www/html/nextcloud` (un seul niveau, pas de `nextcloud/nextcloud` comme en préprod) et les données sur le disque de 350 Go monté sur `/opt/nextcloud`.
+
+**Ressources livrées (PV Claranet, page 3/11)**
+
+| Élément | Valeur |
+| --- | --- |
+| Environnement | PROD IF, domaine `nickel-if` |
+| Serveur | NICSFS001, VM RHEL 9.8, type d'infogérance Managed OS |
+| IP / VLAN | 10.20.57.6, VLAN NICPRODIF |
+| Dimensionnement | 4 vCPU, 8 Go RAM, 406 Go disque |
+| Middlewares | ESET, Wazuh, Tanium, Illumio |
+| VIP | NAT, 185.29.43.171 (`nicsfs001.prj-3dqlak.alias.fr.clara.net`), IP publique en flux entrant |
+| DNS | `sfs.nickel.eu` à basculer sur la nouvelle IP publique après le déploiement |
+
+**Disques constatés** : `/` 12 Go, `/var` 15 Go, `/tmp` 5 Go, `/home` 5 Go, `/opt/Tanium` 15 Go, `/opt/nextcloud` 350 Go (`/dev/sdf`). La RAM affiche 7,5 Gi et le swap 4 Gi.
+
+**Nommage retenu pour la prod**
+
+| Objet | Valeur |
+| --- | --- |
+| Racine web | `/var/www/html/nextcloud` |
+| Répertoire de données | `/opt/nextcloud/data` |
+| Base PostgreSQL | `nextcloud_prd` |
+| Rôle applicatif | `s_nextcloud_prd` (propriétaire de la base, **pas** superuser) |
+| Compte admin Nextcloud | `admin_nextcloud_prd` |
+| Certificat / clé | `/etc/pki/tls/certs/nextcloud_prd.pem` · `/etc/pki/tls/private/nextcloud_prd.key` |
+| Vhost Apache | `/etc/httpd/conf.d/nextcloud.conf` |
+| Utilisateur système | `apache` |
+
+**Points à confirmer avant de commencer**
+
+- [ ] La VIP est de type NAT : le TLS se termine donc sur Apache. Si la VIP termine le TLS elle-même, appliquer la variante reverse proxy de la section Proxy.
+- [ ] Adresse du proxy sortant de prod. En préprod, c'était `nicproxylb001.nickel.as44099.net:3128`.
+- [ ] Flux Illumio ouverts depuis 10.20.57.6 vers le proxy (3128) et vers l'IdP SAML de prod.
+
+## Vérifications préalables
+
+À passer en root avant toute installation, pour confirmer que le serveur correspond au PV et que les briques de l'hébergeur répondent.
+
+**Préparation de la session** : les commandes qui commencent par une espace ne seront pas enregistrées dans l'historique. Cela évite d'y laisser des mots de passe, comme c'est arrivé en préprod.
+
+```bash
+export HISTCONTROL=ignoreboth
+```
+
+**Matériel et OS**
+
+```bash
+cat /etc/redhat-release                       # RHEL 9.8 attendu
+hostnamectl                                    # nicsfs001
+lscpu | grep -E "Model name|CPU\(s\):|Thread|Socket"   # 4 CPU
+free -h                                        # ~7,5 Gi RAM, 4 Gi swap
+df -h / /var /tmp /opt/nextcloud               # /opt/nextcloud = 350G
+lsblk -f
+findmnt /opt/nextcloud                         # bien un point de montage dédié
+ip -br a                                       # 10.20.57.6
+```
+
+**Briques fournies par l'hébergeur**
+
+```bash
+httpd -v
+rpm -q mod_ssl
+php -v                                         # cf. section PHP pour la version
+php -m                                         # liste des modules chargés
+systemctl status php-fpm --no-pager
+dnf module list postgresql php
+rpm -qa | grep -E "^postgresql"
+```
+
+**Sécurité et réseau**
+
+```bash
+getenforce                                     # Enforcing attendu : on garde SELinux actif
+firewall-cmd --state && firewall-cmd --list-all
+env | grep -i proxy
+cat /etc/dnf/dnf.conf | grep -i proxy
+ss -tlnp                                       # ports déjà en écoute (80, 443, 5432…)
+timedatectl                                    # NTP synchronisé, Europe/Paris
+```
+
+**Archive Nextcloud déposée sur la VM**
+
+```bash
+ls -lh /tmp/nextcloud-34.*-enterprise.zip
+sha256sum /tmp/nextcloud-34.*-enterprise.zip   # à comparer avec l'empreinte fournie par Nextcloud
+```
+
+## PostgreSQL local
+
+La base `nextcloud_prd` appartient au rôle `s_nextcloud_prd`. Ce rôle n'est pas superuser et ne se connecte qu'en local, en scram-sha-256. Avec PostgreSQL 15 et plus, le propriétaire de la base a automatiquement les droits sur le schéma `public`, donc aucun GRANT supplémentaire n'est nécessaire.
+
+**1. Vérifier ce que l'hébergeur a déjà fait**
+
+```bash
+systemctl status postgresql --no-pager
+ls /var/lib/pgsql/data/PG_VERSION && cat /var/lib/pgsql/data/PG_VERSION   # 16 attendu
+```
+
+Si le cluster n'est pas encore initialisé :
+
+```bash
+dnf module enable -y postgresql:16
+dnf install -y postgresql-server postgresql-contrib
+postgresql-setup --initdb
+systemctl enable --now postgresql
+```
+
+**2. Créer le rôle et la base, sans mettre le mot de passe sur la ligne de commande**
+
+```bash
+sudo -u postgres psql
+```
+
+```sql
+CREATE ROLE s_nextcloud_prd WITH LOGIN;
+\password s_nextcloud_prd
+CREATE DATABASE nextcloud_prd OWNER s_nextcloud_prd ENCODING 'UTF8' TEMPLATE template0;
+\q
+```
+
+`\password` demande le mot de passe en saisie masquée. Il n'apparaît donc ni dans l'historique bash, ni dans `~/.psql_history`.
+
+**3. Restreindre l'écoute et l'authentification**
+
+Dans `/var/lib/pgsql/data/postgresql.conf` :
+
+```
+listen_addresses = 'localhost'
+password_encryption = scram-sha-256
+```
+
+Dans `/var/lib/pgsql/data/pg_hba.conf`, ajouter ces lignes avant les lignes `host all all` existantes :
+
+```
+# TYPE  DATABASE        USER             ADDRESS        METHOD
+local   all             postgres                        peer
+host    nextcloud_prd   s_nextcloud_prd  127.0.0.1/32   scram-sha-256
+host    nextcloud_prd   s_nextcloud_prd  ::1/128        scram-sha-256
+```
+
+```bash
+systemctl restart postgresql
+```
+
+**4. Vérifier**
+
+```bash
+ss -tlnp 'sport = :5432'                       # uniquement 127.0.0.1 / ::1
+psql -h 127.0.0.1 -U s_nextcloud_prd -d nextcloud_prd -c 'SELECT version();'
+sudo -u postgres psql -c '\du s_nextcloud_prd'  # pas d'attribut Superuser
+sudo -u postgres psql -c '\l nextcloud_prd'     # Owner = s_nextcloud_prd, UTF8
+```
+
+## PHP
+
+C'est l'étape qui a fait échouer `occ maintenance:install` plusieurs fois en préprod, à cause de `posix`, `pgsql`, `gd` et `zip` manquants. Il faut donc valider `php -m` avant de lancer l'installation. Sous RHEL, Apache passe par PHP-FPM : les réglages se font dans `php.ini` et le pool FPM, pas dans `.htaccess`.
+
+**1. Version** : contrôler la version de PHP exigée par Nextcloud 34 dans la doc d'administration. Si celle installée par l'hébergeur est trop ancienne : `dnf module reset php && dnf module enable -y php:8.3`.
+
+**2. Modules requis**
+
+```bash
+dnf install -y php-cli php-fpm php-common php-pgsql php-gd php-mbstring php-intl \
+  php-bcmath php-gmp php-xml php-process php-opcache php-sodium php-ldap \
+  php-pecl-zip php-pecl-apcu php-pecl-redis5 php-pecl-imagick
+```
+
+Les paquets `php-pecl-*` viennent d'EPEL ou Remi : selon le dépôt, `php-pecl-redis5` peut s'appeler `php-redis`. `php-pecl-imagick` est seulement recommandé (miniatures).
+
+Contrôle :
+
+```bash
+php -m | grep -Ei '^(pgsql|pdo_pgsql|gd|zip|posix|intl|mbstring|bcmath|gmp|xml|curl|opcache|zend opcache|apcu|redis|sodium|imagick|ldap)$'
+```
+
+**3. `/etc/php.ini`**
+
+```ini
+memory_limit = 1G
+upload_max_filesize = 16G
+post_max_size = 16G
+max_execution_time = 3600
+max_input_time = 3600
+output_buffering = Off
+date.timezone = Europe/Paris
+```
+
+**4. OPcache** : `/etc/php.d/10-opcache.ini`
+
+```ini
+opcache.enable=1
+opcache.interned_strings_buffer=32
+opcache.max_accelerated_files=10000
+opcache.memory_consumption=256
+opcache.save_comments=1
+opcache.revalidate_freq=60
+```
+
+**5. APCu pour le CLI** (nécessaire pour `occ` et cron) : dans `/etc/php.d/40-apcu.ini`
+
+```ini
+apc.enable_cli=1
+```
+
+**6. Pool FPM** : `/etc/php-fpm.d/www.conf`
+
+```ini
+user = apache
+group = apache
+pm = dynamic
+pm.max_children = 30
+pm.start_servers = 6
+pm.min_spare_servers = 4
+pm.max_spare_servers = 12
+; décommenter pour que Nextcloud voie le PATH et le proxy système
+env[HOSTNAME] = $HOSTNAME
+env[PATH] = /usr/local/bin:/usr/bin:/bin
+env[TMP] = /tmp
+env[TMPDIR] = /tmp
+env[TEMP] = /tmp
+```
+
+Avec 8 Go et environ 100 à 150 Mo par worker, `max_children = 30` laisse de la marge à PostgreSQL. C'est largement suffisant pour 10 à 20 utilisateurs simultanés.
+
+```bash
+php-fpm -t && systemctl enable --now php-fpm && systemctl restart php-fpm
+php -i | grep -E 'memory_limit|upload_max_filesize|opcache.enable |apc.enable_cli'
+```
+
+## Déploiement de Nextcloud
+
+L'archive contient déjà un dossier `nextcloud/` à sa racine. En préprod, un `mv nextcloud /var/www/html/nextcloud` alors que la cible existait déjà a produit `/var/www/html/nextcloud/nextcloud`. Ici, on décompresse directement dans `/var/www/html` et on vérifie avant que la cible n'existe pas.
+
+**1. Décompresser au bon endroit**
+
+```bash
+test -e /var/www/html/nextcloud && echo "STOP : la cible existe déjà" 
+unzip -l /tmp/nextcloud-34.*-enterprise.zip | head -5     # 1er niveau = nextcloud/
+unzip -q /tmp/nextcloud-34.*-enterprise.zip -d /var/www/html/
+ls /var/www/html/nextcloud/occ /var/www/html/nextcloud/version.php   # doivent exister
+test -d /var/www/html/nextcloud/nextcloud && echo "ERREUR : double niveau"
+```
+
+**2. Répertoire de données hors racine web**
+
+```bash
+mkdir -p /opt/nextcloud/data
+chown -R apache:apache /var/www/html/nextcloud /opt/nextcloud/data
+find /var/www/html/nextcloud -type d -exec chmod 750 {} \;
+find /var/www/html/nextcloud -type f -exec chmod 640 {} \;
+chmod 770 /opt/nextcloud/data
+```
+
+Avant de lancer l'installation, appliquer les contextes SELinux (voir la section SELinux et firewalld). Sinon l'installeur ne peut pas écrire dans `config/` ni dans `/opt/nextcloud/data`.
+
+**3. Alias `occ`**
+
+```bash
+alias occ='sudo -u apache php /var/www/html/nextcloud/occ'
+```
+
+**4. Installation sans mot de passe en clair dans l'historique**
+
+```bash
+read -rsp 'Mot de passe BDD s_nextcloud_prd : ' NC_DB_PASS; echo
+read -rsp 'Mot de passe admin_nextcloud_prd : ' NC_ADMIN_PASS; echo
+
+sudo -u apache php /var/www/html/nextcloud/occ maintenance:install \
+  --database=pgsql --database-host="127.0.0.1:5432" \
+  --database-name=nextcloud_prd --database-user=s_nextcloud_prd \
+  --database-pass="$NC_DB_PASS" \
+  --data-dir=/opt/nextcloud/data \
+  --admin-user=admin_nextcloud_prd --admin-pass="$NC_ADMIN_PASS"
+
+unset NC_DB_PASS NC_ADMIN_PASS
+```
+
+**5. Domaines, URL et réécriture**
+
+```bash
+occ config:system:set trusted_domains 0 --value=sfs.nickel.eu
+occ config:system:set trusted_domains 1 --value=nicsfs001
+occ config:system:set trusted_domains 2 --value=10.20.57.6
+occ config:system:set overwrite.cli.url --value=https://sfs.nickel.eu
+occ config:system:set htaccess.RewriteBase --value=/
+occ maintenance:update:htaccess
+```
+
+**6. Cache et verrouillage** : APCu en cache local, Redis en local pour le verrouillage des fichiers.
+
+```bash
+dnf install -y redis
+# /etc/redis/redis.conf : bind 127.0.0.1 -::1 / protected-mode yes / port 6379
+systemctl enable --now redis
+
+occ config:system:set memcache.local --value='\OC\Memcache\APCu'
+occ config:system:set memcache.locking --value='\OC\Memcache\Redis'
+occ config:system:set redis host --value=127.0.0.1
+occ config:system:set redis port --value=6379 --type=integer
+```
+
+**7. Vérifier**
+
+```bash
+occ status                     # installed: true, version 34.x, edition enterprise
+occ config:system:get datadirectory   # /opt/nextcloud/data
+occ config:system:get dbtype           # pgsql
+ls -la /opt/nextcloud/data             # .ocdata + nextcloud.log + dossier admin
+```
+
+## Apache
+
+Un seul vhost, `/etc/httpd/conf.d/nextcloud.conf`, qui redirige le port 80 vers HTTPS et sert Nextcloud sur le port 443 avec le certificat de prod. `LimitRequestBody 0` est indispensable : depuis httpd 2.4.54, la taille des requêtes est limitée à 1 Go par défaut, ce qui bloquerait les gros dépôts.
+
+**1. Certificat et clé**
+
+```bash
+dnf install -y mod_ssl
+install -m 644 -o root -g root nextcloud_prd.pem /etc/pki/tls/certs/nextcloud_prd.pem
+install -m 600 -o root -g root nextcloud_prd.key /etc/pki/tls/private/nextcloud_prd.key
+restorecon -Rv /etc/pki/tls
+openssl x509 -in /etc/pki/tls/certs/nextcloud_prd.pem -noout -subject -issuer -dates -ext subjectAltName
+# la clé correspond-elle au certificat ? les deux empreintes doivent être identiques
+openssl x509 -noout -pubkey -in /etc/pki/tls/certs/nextcloud_prd.pem | sha256sum
+openssl pkey -pubout -in /etc/pki/tls/private/nextcloud_prd.key | sha256sum
+```
+
+Le `.pem` doit contenir le certificat serveur suivi de la chaîne intermédiaire.
+
+**2. `/etc/httpd/conf.d/nextcloud.conf`**
+
+```apache
+<VirtualHost *:80>
+    ServerName sfs.nickel.eu
+    Redirect permanent / https://sfs.nickel.eu/
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName sfs.nickel.eu
+    DocumentRoot /var/www/html/nextcloud
+
+    SSLEngine on
+    SSLCertificateFile    /etc/pki/tls/certs/nextcloud_prd.pem
+    SSLCertificateKeyFile /etc/pki/tls/private/nextcloud_prd.key
+    Protocols h2 http/1.1
+
+    Header always set Strict-Transport-Security "max-age=15552000; includeSubDomains"
+    LimitRequestBody 0
+
+    <Directory /var/www/html/nextcloud/>
+        Require all granted
+        AllowOverride All
+        Options FollowSymLinks MultiViews
+        <IfModule mod_dav.c>
+            Dav off
+        </IfModule>
+    </Directory>
+
+    ErrorLog  /var/log/httpd/nextcloud_error.log
+    CustomLog /var/log/httpd/nextcloud_access.log combined
+</VirtualHost>
+```
+
+Les redirections `/.well-known/carddav`, `caldav`, `webfinger` et `nodeinfo` sont gérées par le `.htaccess` de Nextcloud, d'où `AllowOverride All`.
+
+**3. Neutraliser la page par défaut et activer**
+
+```bash
+mv /etc/httpd/conf.d/welcome.conf /etc/httpd/conf.d/welcome.conf.disabled
+httpd -M | grep -E 'rewrite|headers|ssl|env|dir|mime|proxy_fcgi'
+apachectl configtest && systemctl enable --now httpd && systemctl reload httpd
+```
+
+**4. Vérifier**
+
+```bash
+httpd -S                                                  # vhosts 80 et 443 sur sfs.nickel.eu
+curl -skI https://127.0.0.1/status.php -H 'Host: sfs.nickel.eu'
+curl -sk https://127.0.0.1/status.php -H 'Host: sfs.nickel.eu'   # "installed":true
+curl -skI https://127.0.0.1/.well-known/caldav -H 'Host: sfs.nickel.eu'  # 301 vers /remote.php/dav/
+openssl s_client -connect 127.0.0.1:443 -servername sfs.nickel.eu </dev/null 2>/dev/null | openssl x509 -noout -subject -dates
+tail -n 30 /var/log/httpd/nextcloud_error.log
+```
+
+## Proxy
+
+La VM n'a pas d'accès direct à Internet. Nextcloud doit donc passer par le proxy sortant pour l'App Store, les mises à jour d'apps (dont `user_saml`, hébergée sur GitHub) et la vérification des correctifs. Ce réglage se fait dans `config.php` via `occ`. Les variables d'environnement du shell ne suffisent pas, car PHP-FPM ne les voit pas.
+
+**1. Tester le proxy depuis la VM avant de configurer Nextcloud**
+
+```bash
+PROXY=http://<proxy-prod>:3128      # préprod : http://nicproxylb001.nickel.as44099.net:3128
+for u in https://apps.nextcloud.com/api/v1/apps.json \
+         https://updates.nextcloud.com/ \
+         https://github.com \
+         https://objects.githubusercontent.com \
+         https://release-assets.githubusercontent.com ; do
+  printf '%-55s ' "$u"; curl -x "$PROXY" -so /dev/null -w '%{http_code}\n' -m 15 "$u"
+done
+```
+
+Toute réponse 2xx ou 3xx est bonne. `000` signale un flux bloqué, par Illumio ou par le proxy. Si le proxy fait de l'inspection TLS, vérifier l'émetteur avec `curl -x "$PROXY" -sv -o /dev/null https://apps.nextcloud.com 2>&1 | grep -E 'subject|issuer'`. Si c'est une CA interne, l'ajouter dans `/etc/pki/ca-trust/source/anchors/` puis lancer `update-ca-trust`.
+
+**2. Déclarer le proxy dans Nextcloud**
+
+```bash
+occ config:system:set proxy --value="<proxy-prod>:3128"
+occ config:system:set proxyexclude --type=json \
+  --value='["localhost","127.0.0.1","::1",".nickel-if"]'
+```
+
+Si le proxy demande une authentification : `occ config:system:set proxyuserpwd --value="user:motdepasse"`, à lancer avec une espace devant pour ne pas laisser de trace dans l'historique. Ajouter aussi à `proxyexclude` l'IdP SAML de prod s'il est joignable en direct.
+
+Dans `proxyexclude`, il faut mettre des noms d'hôtes ou des suffixes de domaine : les plages CIDR ne sont pas prises en compte.
+
+**3. Vérifier**
+
+```bash
+occ config:system:get proxy
+occ app:update --showonly        # interroge l'App Store via le proxy
+occ app:update user_saml -vvv    # si besoin, montre la résolution et le téléchargement
+tail -n 20 /opt/nextcloud/data/nextcloud.log | python3 -m json.tool | grep -E '"message"|Exception'
+```
+
+**Variante : la VIP termine le TLS (reverse proxy)**
+
+Cette variante ne s'applique que si Claranet confirme que la VIP déchiffre le trafic et rappelle le serveur en HTTP ou en HTTPS. Avec une VIP en NAT pur, rien à faire.
+
+```bash
+occ config:system:set trusted_proxies 0 --value=<IP interne de la VIP / LB>
+occ config:system:set forwarded_for_headers 0 --value=HTTP_X_FORWARDED_FOR
+occ config:system:set overwriteprotocol --value=https
+occ config:system:set overwritehost --value=sfs.nickel.eu
+```
+
+Pour vérifier : dans *Administration > Vue d'ensemble*, l'avertissement sur l'en-tête de reverse proxy doit disparaître. Les IP clientes doivent apparaître dans les journaux, pas celle de la VIP.
+
+## SELinux et firewalld
+
+On garde SELinux en mode Enforcing. Apache n'a le droit d'écrire que dans le répertoire de données et les quelques dossiers que Nextcloud modifie, et il doit être autorisé à sortir vers PostgreSQL, Redis, le proxy et l'IdP. Cette section est à appliquer avant `occ maintenance:install`.
+
+**1. Contextes de fichiers**
+
+```bash
+semanage fcontext -a -t httpd_sys_rw_content_t '/opt/nextcloud/data(/.*)?'
+semanage fcontext -a -t httpd_sys_rw_content_t '/var/www/html/nextcloud/config(/.*)?'
+semanage fcontext -a -t httpd_sys_rw_content_t '/var/www/html/nextcloud/apps(/.*)?'
+semanage fcontext -a -t httpd_sys_rw_content_t '/var/www/html/nextcloud/.htaccess'
+semanage fcontext -a -t httpd_sys_rw_content_t '/var/www/html/nextcloud/.user.ini'
+semanage fcontext -a -t httpd_sys_rw_content_t '/var/www/html/nextcloud/3rdparty/aws/aws-sdk-php/src/data/logs(/.*)?'
+restorecon -Rv /var/www/html/nextcloud /opt/nextcloud/data
+```
+
+**2. Booléens**
+
+```bash
+setsebool -P httpd_can_network_connect on      # proxy 3128, Redis 6379, IdP SAML
+setsebool -P httpd_can_network_connect_db on   # PostgreSQL 5432
+setsebool -P httpd_can_sendmail on             # seulement si l'envoi de mails passe par sendmail
+```
+
+Pour une mise à jour avec l'updater web, il faut temporairement mettre toute la racine en `httpd_sys_rw_content_t`, puis remettre les contextes. Le plus simple est de faire les mises à jour en CLI avec `occ upgrade`.
+
+**3. Diagnostic si quelque chose est refusé**
+
+```bash
+ausearch -m avc -ts recent
+ausearch -m avc -ts recent | audit2why
+```
+
+**4. Firewalld**
+
+```bash
+firewall-cmd --permanent --add-service=http --add-service=https
+firewall-cmd --reload
+firewall-cmd --list-services
+```
+
+Ne pas ouvrir 5432 ni 6379 : PostgreSQL et Redis n'écoutent que sur localhost. Illumio peut aussi filtrer en amont : vérifier que la politique autorise le 443 entrant depuis la VIP, ainsi que les sorties vers le proxy et l'IdP.
+
+**5. Vérifier**
+
+```bash
+getenforce                                              # Enforcing
+ls -Zd /opt/nextcloud/data /var/www/html/nextcloud/config   # httpd_sys_rw_content_t
+getsebool httpd_can_network_connect httpd_can_network_connect_db
+ausearch -m avc -ts today | grep -c denied              # 0 attendu après une navigation complète
+```
+
+## Post-installation
+
+Il reste à planifier les tâches de fond, régler la langue et la rétention, et compléter la base. Le `VACUUM ANALYZE` passe par le compte `postgres` en authentification peer, ce qui évite d'avoir besoin d'un `.pgpass` avec mot de passe comme en préprod.
+
+**1. Tâches de fond en cron**
+
+```bash
+occ background:cron
+crontab -u apache -e
+```
+
+```
+*/5 * * * * php -f /var/www/html/nextcloud/cron.php --define apc.enable_cli=1
+```
+
+**2. Langue, région, fenêtre de maintenance**
+
+Aucun `force_language` : chaque utilisateur reçoit la langue de son navigateur. Le français ne sert qu'en repli.
+
+```bash
+occ config:system:delete force_language
+occ config:system:set default_language --value=fr
+occ config:system:set default_locale --value=fr_FR
+occ config:system:set default_phone_region --value=FR
+occ config:system:set maintenance_window_start --type=integer --value=1   # 01h UTC
+```
+
+**3. Rétention et journaux**
+
+```bash
+occ config:system:set trashbin_retention_obligation --value="auto, 30"
+occ config:system:set versions_retention_obligation --value="auto, 30"
+occ config:system:set loglevel --value=2 --type=integer
+occ config:system:set log_rotate_size --value=104857600 --type=integer   # 100 Mo
+```
+
+**4. Compléments de base de données**
+
+```bash
+occ db:add-missing-indices
+occ db:add-missing-columns
+occ db:add-missing-primary-keys
+occ maintenance:repair --include-expensive
+```
+
+**5. Maintenance PostgreSQL hebdomadaire** : crontab du compte `postgres`, sans mot de passe
+
+```bash
+crontab -u postgres -e
+```
+
+```
+30 2 * * 0 /usr/bin/vacuumdb -d nextcloud_prd --analyze-only >> /var/lib/pgsql/vacuumdb_$(date +\%F).log 2>&1
+```
+
+**6. Apps** : activer celles du périmètre (`user_saml` pour le SSO), désactiver celles qui ne servent pas.
+
+```bash
+occ app:install user_saml || occ app:enable user_saml
+occ app:list --disabled
+```
+
+**7. Hygiène de la session**
+
+```bash
+history | grep -Ei 'pass|pwd|secret'     # ne doit rien renvoyer de sensible
+```
+
+En préprod, l'historique de root contient le mot de passe admin et celui d'un rôle PostgreSQL superuser. Il faut changer ces mots de passe, supprimer ce rôle s'il n'est plus utilisé et purger les lignes concernées avec `history -d <n>` puis `history -w`.
+
+## Checklist de validation finale
+
+L'installation est validée quand tous les points ci-dessous sont cochés, `occ setupchecks` compris (avertissements expliqués ou acceptés).
+
+```bash
+occ status
+occ setupchecks
+occ check
+occ config:list system --private | grep -vEi 'pass|secret|salt'
+```
+
+- [ ] `occ status` : installed true, version 34.x, édition enterprise, maintenance false
+- [ ] Code dans `/var/www/html/nextcloud` uniquement, pas de `/var/www/html/nextcloud/nextcloud`
+- [ ] `datadirectory` = `/opt/nextcloud/data`, sur le disque de 350 Go (`df -h /opt/nextcloud`)
+- [ ] PostgreSQL n'écoute que sur localhost ; `s_nextcloud_prd` est propriétaire de `nextcloud_prd` et n'est pas superuser
+- [ ] `php -m` contient pgsql, gd, zip, posix, intl, mbstring, bcmath, gmp, apcu, redis, opcache
+- [ ] `https://sfs.nickel.eu/status.php` répond avec le bon certificat (subject, SAN, dates)
+- [ ] Le port 80 redirige en 301 vers HTTPS ; `/.well-known/caldav` redirige en 301
+- [ ] Envoi d'un fichier de plus de 1 Go réussi (valide `LimitRequestBody` et les limites PHP)
+- [ ] `occ app:update --showonly` répond via le proxy ; `user_saml` installée et à jour
+- [ ] Cron : *Administration > Paramètres de base* affiche « Cron » et une dernière exécution de moins de 10 minutes
+- [ ] Langue : un navigateur en anglais affiche l'interface en anglais, un navigateur en français l'affiche en français
+- [ ] SELinux en Enforcing et aucun AVC `denied` après une navigation complète (envoi, partage, aperçu, admin)
+- [ ] firewalld : seuls http et https sont ouverts côté Nextcloud ; flux Illumio validés
+- [ ] Aucun mot de passe dans `history` de root ni du compte `t_sfs001_a_prd`
+- [ ] Bascule DNS de `sfs.nickel.eu` vers 185.29.43.171 planifiée avec Nickel, puis test depuis l'extérieur
+
+**Test externe après la bascule DNS**
+
+```bash
+dig +short sfs.nickel.eu                       # 185.29.43.171
+curl -sI https://sfs.nickel.eu/status.php      # 200
+curl -s https://sfs.nickel.eu/status.php
+```
