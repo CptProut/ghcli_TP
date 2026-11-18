@@ -1,0 +1,4 @@
+SEARCH Package
+WHERE name MATCHES '(?i)(openjdk|jdk|jre|java-)'
+AND version MATCHES '^((17[.]0[.]([6-9]|1[0-9]|20)|21[.]0[.]([0-9]|1[0-2])|25[.]0[.][0-4]|27[.]0[.]0)([.+~-]|$)|(17[.]0[.]21|21[.]0[.]13|25[.]0[.]5|27[.]0[.]1)([.]0([.]|$)|[+~-]|$))'
+SHOW name, version, revision, os, #:::Host.name
