@@ -1,11 +1,84 @@
-SEARCH SoftwareInstance
-WHERE type MATCHES '(?i)nginx'
-AND (version MATCHES '^1[.](9[.]([5-9]|1[0-9])|(1[0-9]|2[0-9]|30)[.][0-9]+|31[.][0-8])([^0-9]|$)'
-  OR product_version MATCHES '^1[.](9[.]([5-9]|1[0-9])|(1[0-9]|2[0-9]|30)[.][0-9]+|31[.][0-8])([^0-9]|$)'
-  OR full_version MATCHES '^1[.](9[.]([5-9]|1[0-9])|(1[0-9]|2[0-9]|30)[.][0-9]+|31[.][0-8])([^0-9]|$)')
-SHOW name, type, version, full_version, #RunningSoftware:HostedSoftware:Host:Host.name
+📋 Bilan & Chronologie du déploiement Nextcloud
+1. Préparation & Cadrage technique
 
-SEARCH Package
-WHERE name MATCHES '(?i)^nginx'
-AND version MATCHES '^1[.](9[.]([5-9]|1[0-9])|(1[0-9]|2[0-9]|30)[.][0-9]+|31[.][0-8])([^0-9]|$)'
-SHOW name, version, revision, os, #:::Host.name
+    Livraison initiale : Retard sur la livraison de la machine de pré-prod et de la documentation officielle. Préparation de l'installation à partir des guides communautaires.
+
+    Arbitrage d'architecture (Stack) : Choix d'une stack classique. Docker écarté pour deux raisons :
+
+        Risque d'avoir un pod isolé hors Rancher.
+
+        Absence d'images Docker certifiées "Entreprise" (uniquement communautaires).
+
+2. Première installation (Base de données déportée)
+
+    Mise en œuvre : Déploiement initial en s'appuyant sur une BDD déportée.
+
+    Actions réalisées : Demande et ouverture des flux réseau, coordination avec l'équipe DBA pour la création de la base, puis installation de Nextcloud pointant sur cette BDD.
+
+    Revisite du besoin : Décision projet de basculer la BDD en local.
+
+        Décommissionnement / désinstallation de l'existant.
+
+        Demande de fermeture des flux devenus inutiles.
+
+        Analyse des contraintes liées à une base locale.
+
+3. Deuxième installation (Base de données en local)
+
+    Contraintes & Alertes :
+
+        Exigences DBA : Nécessité d'ouvrir les flux pour Nicgate et Control-M.
+
+        Dimensionnement : Challenge porté auprès du projet concernant le dimensionnement de la VM (non prévue à l'origine pour héberger à la fois Nextcloud et la BDD). Retour projet : ajustement au fil de l'eau selon la charge.
+
+    Déploiement & Ajustements :
+
+        Réinstallation avec la BDD en local.
+
+        Tuning mémoire : Reconfiguration manuelle du memory_limit PHP (passé de 128 Mo par défaut à 512 Mo recommandés pour éviter les crashs).
+
+        Gestion des accès : Les accès CyberArk n'ayant pas été anticipés par le DBA, création manuelle des comptes utilisateurs requis.
+
+4. Authentification, SSO & Optimisation
+
+    Abandon de l'annuaire ADIF / LDAP :
+
+        Contrainte de sécurité ADIF interdisant l'ouverture de flux vers le LDAP : abandon de la configuration du module LDAP.
+
+    Mise en place du SSO :
+
+        Ateliers avec Melvynn pour adapter le SSO (traitement de la trame spécifique renvoyée par Nextcloud).
+
+        Arbitrage ressources : La combinaison du module LDAP et du SSO entraînant des surconsommations et des crashs, désinstallation définitive du module LDAP.
+
+5. Services annexes & Modules complémentaires
+
+    Marketplace Nextcloud : Demande d'ouverture de flux et configuration du proxy pour autoriser l'accès au marketplace (simplification de la maintenance des modules).
+
+    Configuration SMTP / Mail :
+
+        Souhaits du CSIRT d'utiliser le compte Alerte CSIRT, mais refus de partager la configuration/mot de passe.
+
+        Contournement : ouverture de flux vers le SMTP Google et configuration du compte final prise en charge par Maroussia.
+
+    Module Terms of Service (ToS) : Intégration et paramétrage du module de validation de la charte d'utilisation par les utilisateurs avant accès au service (ajouté au périmètre de recette).
+
+6. Recette technique & Bilan des blocages
+
+    Première recette (Périmètre individuel) : Validation fonctionnelle et technique réussie sur l'ensemble des points attribués.
+
+    Atelier de synchronisation (avec Maroussia) :
+
+        Revue des sujets restants (notamment la validation du TOTP).
+
+        Constat du paramétrage de l'interface graphique (charte Orange / Nickel, logos, etc.) réalisé directement par le CSIRT.
+
+    Analyse globale : Les principaux points de blocage (bumps) ont été majoritairement liés à des demandes d'alignement fonctionnel plutôt qu'à de pure contraintes techniques.
+
+7. Passage en Production & Finalisation
+
+    Livraison de la VM de Prod : Machine de prod enfin livrée, spécifications validées.
+
+    Gestion des middlewares : Demande auprès de Clara pour l'installation des différents middlewares sur la prod, afin d'assurer leur prise en compte directe dans la politique de patching (correctif par rapport aux oublis de la pré-prod).
+
+    Documentation : Rédaction en cours des dossiers d'installation et d'exploitation (DAT/DEX) avant le déroulement final des opérations sur l'environnement de production.
