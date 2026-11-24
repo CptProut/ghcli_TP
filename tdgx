@@ -1,84 +1,295 @@
-📋 Bilan & Chronologie du déploiement Nextcloud
-1. Préparation & Cadrage technique
+#!/usr/bin/env bash
+#
+# add-sa.sh — Assistant interactif pour gérer les comptes de service du mep.token
+#   1. choix de l'environnement, du namespace, de l'action et des comptes
+#   2. modification du mep.token + affichage du diff
+#   3. commit / push dans k8s-deployment-management
+#   4. sauvegarde du fichier distant puis dépôt en SFTP
+#
+# Prérequis : bash, git, jq (macOS 15+ ou brew install jq), sftp avec clé SSH.
+# Compatible avec le bash 3.2 fourni par macOS.
 
-    Livraison initiale : Retard sur la livraison de la machine de pré-prod et de la documentation officielle. Préparation de l'installation à partir des guides communautaires.
+set -euo pipefail
 
-    Arbitrage d'architecture (Stack) : Choix d'une stack classique. Docker écarté pour deux raisons :
+# ============================================================================
+# CONFIGURATION — à adapter
+# ============================================================================
+REPO_DIR="${REPO_DIR:-$HOME/git/k8s-deployment-management}"
+BACKUP_DIR="$HOME/Documents/Token/backups"
 
-        Risque d'avoir un pod isolé hors Rancher.
+ENVS=("hors-prod" "preprod" "prod")
 
-        Absence d'images Docker certifiées "Entreprise" (uniquement communautaires).
+env_config() {
+    case "$1" in
+        hors-prod)
+            TOKEN_FILE="hors-prod/mep.token"
+            SFTP_TARGET="sftp-nickel-hors-prod@deploy.runiso.com"   # TODO à vérifier
+            REMOTE_PATH="/token/istio-rke2/mep.token"               # TODO à vérifier
+            ;;
+        preprod)
+            TOKEN_FILE="preprod/mep.token"
+            SFTP_TARGET="sftp-nickel-preprod@deploy.runiso.com"     # TODO à vérifier
+            REMOTE_PATH="/token/istio-rke2/mep.token"               # TODO à vérifier
+            ;;
+        prod)
+            TOKEN_FILE="prod/mep.token"
+            SFTP_TARGET="sftp-nickel-prod@deploy.runiso.com"
+            REMOTE_PATH="/token/istio-rke2/mep.token"
+            ;;
+    esac
+}
+# ============================================================================
 
-2. Première installation (Base de données déportée)
+# ---------------------------------------------------------------- affichage
+if [[ -t 1 ]]; then
+    B=$'\e[1m'; R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; N=$'\e[0m'
+else
+    B=""; R=""; G=""; Y=""; C=""; N=""
+fi
+die()   { printf '\n%s❌ %b%s\n' "$R" "$*" "$N" >&2; exit 1; }
+info()  { printf '%b\n' "$*"; }
+title() { printf '\n%s━━ %s ━━%s\n' "$B$C" "$*" "$N"; }
+run()   { printf '  %s$ %s%s\n' "$Y" "$*" "$N"; "$@"; }
 
-    Mise en œuvre : Déploiement initial en s'appuyant sur une BDD déportée.
+ask_yn() {   # ask_yn "question" [défaut o|n]
+    local def="${2:-n}" rep prompt="[o/N]"
+    [[ "$def" == "o" ]] && prompt="[O/n]"
+    while true; do
+        printf '%b %s ' "$1" "$prompt"
+        read -r rep
+        rep="${rep:-$def}"
+        case "$rep" in
+            [oOyY]*) return 0 ;;
+            [nN]*)   return 1 ;;
+        esac
+    done
+}
 
-    Actions réalisées : Demande et ouverture des flux réseau, coordination avec l'équipe DBA pour la création de la base, puis installation de Nextcloud pointant sur cette BDD.
+# Menu numéroté : choose "question" item1 item2 ... -> résultat dans $CHOICE
+choose() {
+    local q="$1"; shift
+    local items=("$@") i rep
+    while true; do
+        info "\n${B}$q${N}"
+        for i in "${!items[@]}"; do
+            printf '  %s%2d)%s %s\n' "$C" $((i + 1)) "$N" "${items[$i]}"
+        done
+        printf '> '
+        read -r rep
+        if [[ "$rep" =~ ^[0-9]+$ ]] && (( rep >= 1 && rep <= ${#items[@]} )); then
+            CHOICE="${items[$((rep - 1))]}"
+            return 0
+        fi
+        info "${R}Choix invalide${N}"
+    done
+}
 
-    Revisite du besoin : Décision projet de basculer la BDD en local.
+# ---------------------------------------------------------------- prérequis
+for cmd in git jq sftp; do
+    command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' introuvable (brew install $cmd)"
+done
+[[ -d "$REPO_DIR/.git" ]] || die "$REPO_DIR n'est pas un dépôt git\n   → modifie REPO_DIR en haut du script"
 
-        Décommissionnement / désinstallation de l'existant.
+title "Gestion des comptes de service — mep.token"
 
-        Demande de fermeture des flux devenus inutiles.
+# ---------------------------------------------------------------- dépôt à jour
+status=$(git -C "$REPO_DIR" status --porcelain)
+[[ -z "$status" ]] || die "le dépôt contient des modifications non commitées, nettoie avant :\n$status"
+info "🔄 Mise à jour du dépôt"
+run git -C "$REPO_DIR" pull --rebase --quiet
 
-        Analyse des contraintes liées à une base locale.
+# ---------------------------------------------------------------- 1. environnement
+choose "Environnement ?" "${ENVS[@]}"
+ENV_NAME="$CHOICE"
+env_config "$ENV_NAME"
+TOKEN_PATH="$REPO_DIR/$TOKEN_FILE"
+[[ -f "$TOKEN_PATH" ]] || die "fichier introuvable : $TOKEN_PATH"
+jq empty "$TOKEN_PATH" 2>/dev/null || die "$TOKEN_PATH n'est pas un JSON valide"
+[[ "$ENV_NAME" == "prod" ]] && info "${R}${B}⚠️  Tu travailles sur la PROD${N}"
 
-3. Deuxième installation (Base de données en local)
+# ---------------------------------------------------------------- 2. action
+choose "Que veux-tu faire ?" \
+    "Ajouter des comptes de service" \
+    "Supprimer des comptes de service (serviceaccounts_to_delete)" \
+    "Redéposer le mep.token actuel sur le serveur (sans modification)"
+ACTION_CHOICE="$CHOICE"
 
-    Contraintes & Alertes :
+# ---------------------------------------------------------------- SFTP
+sftp_upload() {
+    local stamp user backup batch out local_size
+    mkdir -p "$BACKUP_DIR"
+    stamp=$(date +%Y%m%d-%H%M%S)
+    user="${SFTP_TARGET%@*}"
+    backup="$BACKUP_DIR/${user}_mep.token.$stamp"
 
-        Exigences DBA : Nécessité d'ouvrir les flux pour Nicgate et Control-M.
+    title "Dépôt SFTP"
+    info "Cible : ${B}$SFTP_TARGET:$REMOTE_PATH${N}"
+    if ! ask_yn "Envoyer le fichier sur le serveur ?" o; then
+        info "⏭️  Upload annulé. Relance le script et choisis « Redéposer » plus tard."
+        return 0
+    fi
 
-        Dimensionnement : Challenge porté auprès du projet concernant le dimensionnement de la VM (non prévue à l'origine pour héberger à la fois Nextcloud et la BDD). Retour projet : ajustement au fil de l'eau selon la charge.
+    batch=$(mktemp)
+    cat > "$batch" <<EOF
+-get $REMOTE_PATH $backup
+put $TOKEN_PATH $REMOTE_PATH
+ls -l $REMOTE_PATH
+EOF
+    if ! out=$(sftp -b "$batch" "$SFTP_TARGET" 2>&1); then
+        rm -f "$batch"
+        echo "$out" >&2
+        die "échec SFTP (vérifie la clé SSH / ~/.ssh/config)"
+    fi
+    rm -f "$batch"
+    echo "$out"
 
-    Déploiement & Ajustements :
+    local_size=$(wc -c < "$TOKEN_PATH" | tr -d ' ')
+    if grep -q "[[:space:]]$local_size[[:space:]]" <<<"$out"; then
+        info "${G}✅ Fichier déposé ($local_size octets)${N}"
+    else
+        info "${Y}⚠️  Taille locale $local_size octets introuvable dans le listing distant, vérifie.${N}"
+    fi
+    [[ -f "$backup" ]] && info "💾 Ancienne version sauvegardée : $backup"
+    return 0
+}
 
-        Réinstallation avec la BDD en local.
+if [[ "$ACTION_CHOICE" == Redéposer* ]]; then
+    sftp_upload
+    info "\n🎉 Terminé"
+    exit 0
+fi
 
-        Tuning mémoire : Reconfiguration manuelle du memory_limit PHP (passé de 128 Mo par défaut à 512 Mo recommandés pour éviter les crashs).
+DELETE=false
+[[ "$ACTION_CHOICE" == Supprimer* ]] && DELETE=true
 
-        Gestion des accès : Les accès CyberArk n'ayant pas été anticipés par le DBA, création manuelle des comptes utilisateurs requis.
+# ---------------------------------------------------------------- 3. namespace
+ALL_NS=()
+while IFS= read -r ns; do ALL_NS+=("$ns"); done \
+    < <(jq -r '.namespaces[].namespace' "$TOKEN_PATH" | sort)
 
-4. Authentification, SSO & Optimisation
+NAMESPACE=""
+filtered=("${ALL_NS[@]}")
+while [[ -z "$NAMESPACE" ]]; do
+    info "\n${B}Namespace ?${N}  (numéro, nom exact, ou un mot pour filtrer)"
+    for i in "${!filtered[@]}"; do
+        printf '  %s%2d)%s %s\n' "$C" $((i + 1)) "$N" "${filtered[$i]}"
+    done
+    printf '> '
+    read -r rep
+    [[ -z "$rep" ]] && { filtered=("${ALL_NS[@]}"); continue; }
 
-    Abandon de l'annuaire ADIF / LDAP :
+    if [[ "$rep" =~ ^[0-9]+$ ]] && (( rep >= 1 && rep <= ${#filtered[@]} )); then
+        NAMESPACE="${filtered[$((rep - 1))]}"
+    elif printf '%s\n' "${ALL_NS[@]}" | grep -qxF -- "$rep"; then
+        NAMESPACE="$rep"
+    else
+        new=()
+        for ns in "${ALL_NS[@]}"; do
+            [[ "$ns" == *"$rep"* ]] && new+=("$ns")
+        done
+        if [[ ${#new[@]} -gt 0 ]]; then
+            filtered=("${new[@]}")
+        elif [[ "$DELETE" == "false" ]] \
+             && [[ "$rep" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+             && ask_yn "Le namespace '${B}$rep${N}' n'existe pas. Le créer ?"; then
+            NAMESPACE="$rep"
+        else
+            info "${R}Aucun namespace ne correspond à '$rep'${N} (Entrée pour tout réafficher)"
+        fi
+    fi
+done
+info "→ Namespace : ${B}$NAMESPACE${N}"
 
-        Contrainte de sécurité ADIF interdisant l'ouverture de flux vers le LDAP : abandon de la configuration du module LDAP.
+# Affiche les comptes actuels du namespace
+current=$(jq -r --arg ns "$NAMESPACE" \
+    '.namespaces[] | select(.namespace == $ns) | (.serviceaccounts // [])[]' "$TOKEN_PATH" 2>/dev/null || true)
+if [[ -n "$current" ]]; then
+    info "\nComptes actuels dans ${B}$NAMESPACE${N} ($(wc -l <<<"$current" | tr -d ' ')) :"
+    sed 's/^/    · /' <<<"$current"
+fi
 
-    Mise en place du SSO :
+# ---------------------------------------------------------------- 4. comptes
+if [[ "$DELETE" == "true" ]]; then
+    FIELD="serviceaccounts_to_delete"; VERB="supprimer"
+else
+    FIELD="serviceaccounts"; VERB="ajouter"
+fi
 
-        Ateliers avec Melvynn pour adapter le SSO (traitement de la trame spécifique renvoyée par Nextcloud).
+CHANGED=()
+while [[ ${#CHANGED[@]} -eq 0 ]]; do
+    info "\n${B}Compte(s) de service à $VERB${N} (séparés par des espaces) :"
+    printf '> '
+    read -r line
+    ok=true; CHANGED=()
+    for sa in $line; do
+        if [[ ! "$sa" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || (( ${#sa} > 63 )); then
+            info "${R}Nom invalide : '$sa'${N} (minuscules, chiffres, '-', 63 car. max)"
+            ok=false; continue
+        fi
+        if jq -e --arg ns "$NAMESPACE" --arg sa "$sa" --arg f "$FIELD" \
+            'any(.namespaces[]; .namespace == $ns and ((.[$f] // []) | index($sa)))' \
+            "$TOKEN_PATH" >/dev/null; then
+            info "${Y}ℹ️  '$sa' est déjà dans $FIELD, ignoré${N}"
+            continue
+        fi
+        if [[ "$DELETE" == "true" ]] && ! grep -qxF -- "$sa" <<<"$current"; then
+            ask_yn "${Y}'$sa' n'est pas dans la liste actuelle.${N} Le mettre quand même dans to_delete ?" \
+                || continue
+        fi
+        # dédoublonne la saisie
+        if [[ ${#CHANGED[@]} -eq 0 ]] || ! printf '%s\n' "${CHANGED[@]}" | grep -qxF -- "$sa"; then
+            CHANGED+=("$sa")
+        fi
+    done
+    [[ "$ok" == "false" ]] && CHANGED=()
+    if [[ ${#CHANGED[@]} -eq 0 && "$ok" == "true" ]]; then
+        ask_yn "Rien à modifier. Saisir d'autres noms ?" o || { info "Bye 👋"; exit 0; }
+    fi
+done
 
-        Arbitrage ressources : La combinaison du module LDAP et du SSO entraînant des surconsommations et des crashs, désinstallation définitive du module LDAP.
+# ---------------------------------------------------------------- 5. modification
+SAS_JSON=$(printf '%s\n' "${CHANGED[@]}" | jq -R . | jq -s .)
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
 
-5. Services annexes & Modules complémentaires
+jq --indent 4 \
+   --arg ns "$NAMESPACE" \
+   --argjson sas "$SAS_JSON" \
+   --argjson del "$DELETE" '
+  (if any(.namespaces[]; .namespace == $ns) then .
+   else .namespaces += [{"namespace": $ns, "serviceaccounts_to_delete": [], "serviceaccounts": []}]
+   end)
+  | .namespaces |= map(
+      if .namespace == $ns then
+        if $del then
+          .serviceaccounts = ((.serviceaccounts // []) - $sas)
+          | .serviceaccounts_to_delete = ((.serviceaccounts_to_delete // []) + $sas)
+        else
+          .serviceaccounts_to_delete = ((.serviceaccounts_to_delete // []) - $sas)
+          | .serviceaccounts = ((.serviceaccounts // []) + $sas)
+        end
+      else . end)
+' "$TOKEN_PATH" > "$TMP"
+jq empty "$TMP" || die "JSON généré invalide, abandon"
 
-    Marketplace Nextcloud : Demande d'ouverture de flux et configuration du proxy pour autoriser l'accès au marketplace (simplification de la maintenance des modules).
+title "Récapitulatif"
+if [[ "$DELETE" == "true" ]]; then ACTION="Suppression"; else ACTION="Ajout"; fi
+LIST=$(printf '%s, ' "${CHANGED[@]}"); LIST="${LIST%, }"
+info "  Environnement : ${B}$ENV_NAME${N}"
+info "  Namespace     : ${B}$NAMESPACE${N}"
+info "  Action        : ${B}$ACTION${N}"
+info "  Comptes       : ${B}$LIST${N}\n"
+git --no-pager diff --no-index --color "$TOKEN_PATH" "$TMP" || true
 
-    Configuration SMTP / Mail :
+echo
+ask_yn "Valider, commiter et pousser ?" || die "annulé, rien n'a été modifié"
 
-        Souhaits du CSIRT d'utiliser le compte Alerte CSIRT, mais refus de partager la configuration/mot de passe.
+cat "$TMP" > "$TOKEN_PATH"
+title "Commit & push"
+run git -C "$REPO_DIR" add "$TOKEN_FILE"
+run git -C "$REPO_DIR" commit --quiet -m "[$ENV_NAME] $ACTION SA $LIST dans $NAMESPACE"
+run git -C "$REPO_DIR" push --quiet
+info "${G}✅ Poussé sur $(git -C "$REPO_DIR" branch --show-current)${N}"
 
-        Contournement : ouverture de flux vers le SMTP Google et configuration du compte final prise en charge par Maroussia.
-
-    Module Terms of Service (ToS) : Intégration et paramétrage du module de validation de la charte d'utilisation par les utilisateurs avant accès au service (ajouté au périmètre de recette).
-
-6. Recette technique & Bilan des blocages
-
-    Première recette (Périmètre individuel) : Validation fonctionnelle et technique réussie sur l'ensemble des points attribués.
-
-    Atelier de synchronisation (avec Maroussia) :
-
-        Revue des sujets restants (notamment la validation du TOTP).
-
-        Constat du paramétrage de l'interface graphique (charte Orange / Nickel, logos, etc.) réalisé directement par le CSIRT.
-
-    Analyse globale : Les principaux points de blocage (bumps) ont été majoritairement liés à des demandes d'alignement fonctionnel plutôt qu'à de pure contraintes techniques.
-
-7. Passage en Production & Finalisation
-
-    Livraison de la VM de Prod : Machine de prod enfin livrée, spécifications validées.
-
-    Gestion des middlewares : Demande auprès de Clara pour l'installation des différents middlewares sur la prod, afin d'assurer leur prise en compte directe dans la politique de patching (correctif par rapport aux oublis de la pré-prod).
-
-    Documentation : Rédaction en cours des dossiers d'installation et d'exploitation (DAT/DEX) avant le déroulement final des opérations sur l'environnement de production.
+sftp_upload
+info "\n🎉 Terminé"
