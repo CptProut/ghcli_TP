@@ -10,6 +10,380 @@
 #
 # Prérequis : bash, git, jq, sftp avec clé SSH (ou ~/.ssh/config).
 # Compatible avec le bash 3.2 fourni par macOS.
+ 
+set -euo pipefail
+ 
+# ============================================================================
+# CONFIGURATION — à adapter
+# ============================================================================
+REPO_DIR="${REPO_DIR:-$HOME/git/k8s-deployment-management}"
+BACKUP_DIR="$HOME/Documents/Token/backups"
+ 
+# Où appliquer la modification, par environnement.
+# Format : "environnement|fichier|namespace"   ({NS} = namespace saisi)
+# Quand preprod/prod passent en un fichier par namespace, remplacer
+#   preprod/mep.token  par  preprod/{NS}/mep.token   (idem prod)
+TARGETS=(
+    "hors-prod|hors-prod/{NS}/mep.token|dev-{NS}"
+    "hors-prod|hors-prod/{NS}/mep.token|staging-{NS}"
+    "preprod|preprod/mep.token|preprod-{NS}"
+    "prod|prod/mep.token|{NS}"
+    "prod|prod/mep.token|alpha-{NS}"
+    "pcidss|pcidss/mep.token|{NS}"
+)
+ENVS=("hors-prod" "preprod" "prod" "pcidss")
+ 
+# Préfixes des namespaces (pour construire la liste proposée)
+NS_PREFIX_REGEX='^(dev|staging|preprod|alpha)-'
+ 
+# Cible SFTP d'un fichier du dépôt -> "utilisateur@hôte|chemin distant"
+# Vide = pas de dépôt SFTP pour ce fichier (le script le signale).
+SFTP_HOST="deploy.runiso.com"
+SFTP_REMOTE="/token/istio-rke2/mep.token"
+sftp_for() {
+    case "$1" in
+        hors-prod/*)  echo "sftp-nickel@$SFTP_HOST|$SFTP_REMOTE" ;;
+        preprod/*)    echo "sftp-nickel-preprod@$SFTP_HOST|$SFTP_REMOTE" ;;
+        prod/*)       echo "sftp-nickel-prod@$SFTP_HOST|$SFTP_REMOTE" ;;
+        pcidss/*)     echo "" ;;   # TODO : compte SFTP pcidss
+        *)            echo "" ;;
+    esac
+}
+# ============================================================================
+ 
+# ---------------------------------------------------------------- affichage
+if [[ -t 1 ]]; then
+    B=$'\e[1m'; R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; N=$'\e[0m'
+else
+    B=""; R=""; G=""; Y=""; C=""; N=""
+fi
+die()   { printf '\n%s❌ %b%s\n' "$R" "$*" "$N" >&2; exit 1; }
+info()  { printf '%b\n' "$*"; }
+warn()  { printf '%s⚠️  %b%s\n' "$Y" "$*" "$N"; }
+title() { printf '\n%s━━ %s ━━%s\n' "$B$C" "$*" "$N"; }
+run()   { printf '  %s$ %s%s\n' "$Y" "$*" "$N"; "$@"; }
+ 
+ask_yn() {   # ask_yn "question" [défaut o|n]
+    local def="${2:-n}" rep prompt="[o/N]"
+    [[ "$def" == "o" ]] && prompt="[O/n]"
+    while true; do
+        printf '%b %s ' "$1" "$prompt"
+        read -r rep
+        rep="${rep:-$def}"
+        case "$rep" in
+            [oOyY]*) return 0 ;;
+            [nN]*)   return 1 ;;
+        esac
+    done
+}
+ 
+choose() {   # choose "question" item... -> $CHOICE
+    local q="$1"; shift
+    local items=("$@") i rep
+    while true; do
+        info "\n${B}$q${N}"
+        for i in "${!items[@]}"; do
+            printf '  %s%2d)%s %s\n' "$C" $((i + 1)) "$N" "${items[$i]}"
+        done
+        printf '> '
+        read -r rep
+        if [[ "$rep" =~ ^[0-9]+$ ]] && (( rep >= 1 && rep <= ${#items[@]} )); then
+            CHOICE="${items[$((rep - 1))]}"
+            return 0
+        fi
+        info "${R}Choix invalide${N}"
+    done
+}
+ 
+in_list() {  # in_list valeur liste...
+    local v="$1"; shift
+    local x
+    for x in "$@"; do [[ "$x" == "$v" ]] && return 0; done
+    return 1
+}
+ 
+# ---------------------------------------------------------------- JSON
+indent_of() {   # indentation utilisée par le fichier (2 ou 4 en général)
+    local n
+    n=$(sed -n '2p' "$1" | sed 's/[^ ].*//' | awk '{print length}')
+    [[ -z "$n" || "$n" -eq 0 ]] && n=4
+    echo "$n"
+}
+ 
+ns_exists() {   # ns_exists fichier namespace
+    jq -e --arg ns "$2" 'any(.namespaces[]; .namespace == $ns)' "$1" >/dev/null 2>&1
+}
+ 
+# apply fichier namespace mode(add|delete|clean) -> modifie le fichier en place
+apply() {
+    local f="$1" ns="$2" mode="$3" tmp ind
+    ind=$(indent_of "$f")
+    tmp=$(mktemp)
+    jq --indent "$ind" --arg ns "$ns" --arg mode "$mode" --argjson sas "$SAS_JSON" '
+      def addu(a; b): a + (b - a);
+      .namespaces |= map(
+        if .namespace != $ns then .
+        elif $mode == "add" then
+            (if has("serviceaccounts_to_delete") then .serviceaccounts_to_delete -= $sas else . end)
+          | .serviceaccounts = addu(.serviceaccounts // []; $sas)
+        elif $mode == "delete" then
+            (if has("serviceaccounts") then .serviceaccounts -= $sas else . end)
+          | .serviceaccounts_to_delete = addu(.serviceaccounts_to_delete // []; $sas)
+        else
+            (if has("serviceaccounts_to_delete") then .serviceaccounts_to_delete -= $sas else . end)
+        end)
+    ' "$f" > "$tmp" || { rm -f "$tmp"; die "jq a échoué sur $f"; }
+    jq empty "$tmp" || { rm -f "$tmp"; die "JSON invalide généré pour $f"; }
+    cat "$tmp" > "$f"
+    rm -f "$tmp"
+}
+ 
+# ---------------------------------------------------------------- SFTP
+sftp_upload() {   # sftp_upload fichier_relatif
+    local rel="$1" cfg target remote stamp backup batch out size
+    cfg=$(sftp_for "$rel")
+    if [[ -z "$cfg" ]]; then
+        warn "Pas de cible SFTP configurée pour ${B}$rel${N}${Y} (fonction sftp_for), à déposer à la main"
+        return 0
+    fi
+    target="${cfg%%|*}"; remote="${cfg#*|}"
+    mkdir -p "$BACKUP_DIR"
+    stamp=$(date +%Y%m%d-%H%M%S)
+    backup="$BACKUP_DIR/$(echo "$rel" | tr '/' '_').$stamp"
+ 
+    info "\n📤 ${B}$rel${N} → $target:$remote"
+    ask_yn "   Envoyer ?" o || { info "   ⏭️  ignoré"; return 0; }
+ 
+    # '-' devant une commande = on ignore son erreur :
+    #   -get : le dossier est normalement vide (fichier déjà consommé)
+    #   -ls  : le serveur peut récupérer le fichier dès son arrivée
+    batch=$(mktemp)
+    printf -- '-get %s %s\nput %s %s\n-ls -l %s\n' \
+        "$remote" "$backup" "$REPO_DIR/$rel" "$remote" "$remote" > "$batch"
+    if ! out=$(sftp -b "$batch" "$target" 2>&1); then
+        rm -f "$batch"; echo "$out" >&2
+        warn "échec SFTP pour $rel (clé SSH / ~/.ssh/config ?)"
+        return 0
+    fi
+    rm -f "$batch"
+    size=$(wc -c < "$REPO_DIR/$rel" | tr -d ' ')
+    if grep -q "[[:space:]]$size[[:space:]]" <<<"$out"; then
+        info "   ${G}✅ déposé ($size octets)${N}"
+    else
+        info "   ${G}✅ déposé${N} (déjà récupéré par le serveur, le dossier est de nouveau vide)"
+    fi
+    [[ -f "$backup" ]] && info "   💾 un mep.token non traité était présent, sauvegardé : $backup"
+    return 0
+}
+ 
+# ---------------------------------------------------------------- prérequis
+for cmd in git jq sftp; do
+    command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' introuvable (brew install $cmd)"
+done
+[[ -d "$REPO_DIR/.git" ]] || die "$REPO_DIR n'est pas un dépôt git\n   → modifie REPO_DIR en haut du script"
+git -C "$REPO_DIR" remote get-url origin | grep -q 'k8s-deployment-management' \
+    || die "$REPO_DIR ne pointe pas sur k8s-deployment-management"
+ 
+title "Gestion des comptes de service — mep.token"
+ 
+status=$(git -C "$REPO_DIR" status --porcelain)
+[[ -z "$status" ]] || die "le dépôt contient des modifications non commitées, nettoie avant :\n$status"
+info "🔄 Mise à jour du dépôt"
+run git -C "$REPO_DIR" pull --rebase --quiet
+cd "$REPO_DIR"
+ 
+# ---------------------------------------------------------------- 1. action
+choose "Que veux-tu faire ?" \
+    "Ajouter des comptes de service" \
+    "Supprimer des comptes de service (→ serviceaccounts_to_delete)" \
+    "Nettoyer serviceaccounts_to_delete (après traitement de la suppression)" \
+    "Redéposer un mep.token sur le serveur (sans modification)"
+case "$CHOICE" in
+    Ajouter*)   MODE="add";    ACTION="Ajout";       VERB="ajouter" ;;
+    Supprimer*) MODE="delete"; ACTION="Suppression"; VERB="supprimer" ;;
+    Nettoyer*)  MODE="clean";  ACTION="Nettoyage";   VERB="retirer de serviceaccounts_to_delete" ;;
+    *)          MODE="upload" ;;
+esac
+ 
+if [[ "$MODE" == "upload" ]]; then
+    FILES=()
+    while IFS= read -r f; do FILES+=("${f#./}"); done < <(find . -name mep.token | sort)
+    choose "Quel fichier ?" "${FILES[@]}"
+    sftp_upload "$CHOICE"
+    info "\n🎉 Terminé"
+    exit 0
+fi
+ 
+# ---------------------------------------------------------------- 2. namespace
+ALL_NS=()
+while IFS= read -r ns; do [[ -n "$ns" ]] && ALL_NS+=("$ns"); done < <(
+    {
+        for f in prod/mep.token preprod/mep.token pcidss/mep.token hors-prod/mep.token; do
+            [[ -f "$f" ]] && jq -r '.namespaces[].namespace' "$f"
+        done
+        for d in hors-prod/*/ preprod/*/ prod/*/; do
+            [[ -f "$d/mep.token" ]] && basename "$d"
+        done
+    } | sed -E "s/$NS_PREFIX_REGEX//" | sort -u
+)
+ 
+NAMESPACE=""
+filtered=("${ALL_NS[@]}")
+while [[ -z "$NAMESPACE" ]]; do
+    info "\n${B}Namespace ?${N}  (numéro, nom exact, ou un mot pour filtrer — sans préfixe dev-/staging-/preprod-/alpha-)"
+    for i in "${!filtered[@]}"; do
+        printf '  %s%2d)%s %s\n' "$C" $((i + 1)) "$N" "${filtered[$i]}"
+    done
+    printf '> '
+    read -r rep
+    [[ -z "$rep" ]] && { filtered=("${ALL_NS[@]}"); continue; }
+    if [[ "$rep" =~ ^[0-9]+$ ]] && (( rep >= 1 && rep <= ${#filtered[@]} )); then
+        NAMESPACE="${filtered[$((rep - 1))]}"
+    elif in_list "$rep" "${ALL_NS[@]}"; then
+        NAMESPACE="$rep"
+    else
+        new=()
+        for ns in "${ALL_NS[@]}"; do [[ "$ns" == *"$rep"* ]] && new+=("$ns"); done
+        if [[ ${#new[@]} -gt 0 ]]; then
+            filtered=("${new[@]}")
+        else
+            info "${R}Aucun namespace ne correspond à '$rep'${N} (Entrée pour tout réafficher)"
+        fi
+    fi
+done
+info "→ Namespace : ${B}$NAMESPACE${N}"
+ 
+# ---------------------------------------------------------------- 3. environnements
+info "\n${B}Environnements ?${N}  (Entrée = tous, sinon numéros séparés par des espaces)"
+for i in "${!ENVS[@]}"; do printf '  %s%2d)%s %s\n' "$C" $((i + 1)) "$N" "${ENVS[$i]}"; done
+SEL_ENVS=()
+while [[ ${#SEL_ENVS[@]} -eq 0 ]]; do
+    printf '> '
+    read -r rep
+    if [[ -z "$rep" ]]; then
+        SEL_ENVS=("${ENVS[@]}")
+    else
+        for n in $rep; do
+            if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#ENVS[@]} )); then
+                SEL_ENVS+=("${ENVS[$((n - 1))]}")
+            else
+                info "${R}Choix invalide : $n${N}"; SEL_ENVS=(); break
+            fi
+        done
+    fi
+done
+ 
+# Résout les cibles (fichier + vrai namespace) et vérifie leur existence
+T_FILES=(); T_NS=()
+info "\n${B}Cibles :${N}"
+for t in "${TARGETS[@]}"; do
+    env="${t%%|*}"; rest="${t#*|}"; file="${rest%%|*}"; nsp="${rest#*|}"
+    in_list "$env" "${SEL_ENVS[@]}" || continue
+    file="${file//\{NS\}/$NAMESPACE}"
+    nsp="${nsp//\{NS\}/$NAMESPACE}"
+    if [[ ! -f "$file" ]]; then
+        warn "$env : fichier $file absent, ignoré"
+    elif ! ns_exists "$file" "$nsp"; then
+        warn "$env : namespace '$nsp' absent de $file, ignoré"
+    else
+        info "  ${G}✓${N} $env : $file → $nsp"
+        T_FILES+=("$file"); T_NS+=("$nsp")
+    fi
+done
+[[ ${#T_FILES[@]} -gt 0 ]] || die "aucune cible valide pour '$NAMESPACE'"
+in_list "prod" "${SEL_ENVS[@]}" && info "${R}${B}⚠️  La PROD fait partie des cibles${N}"
+ 
+# Aide : pour le nettoyage, on affiche ce qu'il y a dans to_delete
+if [[ "$MODE" == "clean" ]]; then
+    info "\nContenu actuel de serviceaccounts_to_delete :"
+    for i in "${!T_FILES[@]}"; do
+        list=$(jq -r --arg ns "${T_NS[$i]}" \
+            '.namespaces[] | select(.namespace == $ns) | (.serviceaccounts_to_delete // []) | join(", ")' "${T_FILES[$i]}")
+        info "  ${T_NS[$i]} (${T_FILES[$i]}) : ${list:-<vide>}"
+    done
+fi
+ 
+# ---------------------------------------------------------------- 4. comptes
+SAS=()
+while [[ ${#SAS[@]} -eq 0 ]]; do
+    info "\n${B}Compte(s) de service à $VERB${N} (séparés par des espaces) :"
+    printf '> '
+    read -r line
+    ok=true
+    for sa in $line; do
+        if [[ ! "$sa" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || (( ${#sa} > 63 )); then
+            info "${R}Nom invalide : '$sa'${N} (minuscules, chiffres, '-', 63 car. max)"
+            ok=false
+        elif [[ ${#SAS[@]} -eq 0 ]] || ! in_list "$sa" "${SAS[@]}"; then
+            SAS+=("$sa")
+        fi
+    done
+    [[ "$ok" == "true" ]] || SAS=()
+done
+SAS_JSON=$(printf '%s\n' "${SAS[@]}" | jq -R . | jq -s -c .)
+LIST=$(printf '%s, ' "${SAS[@]}"); LIST="${LIST%, }"
+ 
+info "\n${B}Référence du ticket${N} (SCTASK…, RITM…, Entrée si aucune) :"
+printf '> '
+read -r TICKET
+ 
+# ---------------------------------------------------------------- 5. modification
+for i in "${!T_FILES[@]}"; do
+    apply "${T_FILES[$i]}" "${T_NS[$i]}" "$MODE"
+done
+ 
+CHANGED_FILES=()
+while IFS= read -r f; do [[ -n "$f" ]] && CHANGED_FILES+=("$f"); done \
+    < <(git diff --name-only)
+if [[ ${#CHANGED_FILES[@]} -eq 0 ]]; then
+    info "\nRien à modifier (comptes déjà dans l'état voulu)."
+    exit 0
+fi
+ 
+title "Récapitulatif"
+info "  Action        : ${B}$ACTION${N}"
+info "  Namespace     : ${B}$NAMESPACE${N}"
+info "  Comptes       : ${B}$LIST${N}"
+info "  Fichiers      : ${B}${CHANGED_FILES[*]}${N}\n"
+git --no-pager diff --color
+ 
+echo
+if ! ask_yn "Valider, commiter et pousser ?"; then
+    git checkout -- "${CHANGED_FILES[@]}"
+    die "annulé, fichiers remis dans leur état d'origine"
+fi
+ 
+MSG="$ACTION SA $LIST dans $NAMESPACE"
+[[ -n "$TICKET" ]] && MSG="$TICKET - $MSG"
+title "Commit & push"
+run git add "${CHANGED_FILES[@]}"
+run git commit --quiet -m "$MSG"
+run git push --quiet
+info "${G}✅ Poussé sur $(git branch --show-current)${N}"
+ 
+# ---------------------------------------------------------------- 6. SFTP
+title "Dépôt SFTP"
+for f in "${CHANGED_FILES[@]}"; do
+    sftp_upload "$f"
+done
+ 
+if [[ "$MODE" == "delete" ]]; then
+    info "\n${Y}Rappel : une fois la suppression traitée, relance le script avec"
+    info "« Nettoyer serviceaccounts_to_delete » pour vider la liste.${N}"
+fi
+info "\n🎉 Terminé"
+ #!/usr/bin/env bash
+#
+# add-sa.sh — Assistant interactif pour gérer les comptes de service des mep.token
+# (remplace edit.sh : plus besoin de modifier NS / SA ni de commenter des lignes)
+#
+#   1. choix de l'action, du namespace, des environnements, des comptes
+#   2. modification de tous les mep.token concernés + affichage du diff
+#   3. commit / push dans k8s-deployment-management
+#   4. sauvegarde des fichiers distants puis dépôt en SFTP
+#
+# Prérequis : bash, git, jq, sftp avec clé SSH (ou ~/.ssh/config).
+# Compatible avec le bash 3.2 fourni par macOS.
 
 set -euo pipefail
 
