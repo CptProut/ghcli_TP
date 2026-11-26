@@ -8,17 +8,21 @@
 #   3. commit / push dans k8s-deployment-management
 #   4. sauvegarde des fichiers distants puis dépôt en SFTP
 #
-# Prérequis : bash, git, jq, sftp avec clé SSH (ou ~/.ssh/config).
+# Prérequis : bash, git, jq, sftp, sshpass (brew install sshpass).
+# Identifiants SFTP : fichier sftp.credentials à côté du script (chmod 600),
+#   une ligne par compte :   utilisateur=motdepasse
 # Compatible avec le bash 3.2 fourni par macOS.
-
+ 
 set -euo pipefail
-
+ 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ 
 # ============================================================================
 # CONFIGURATION — à adapter
 # ============================================================================
 REPO_DIR="${REPO_DIR:-$HOME/git/k8s-deployment-management}"
 BACKUP_DIR="$HOME/Documents/Token/backups"
-
+ 
 # Où appliquer la modification, par environnement.
 # Format : "environnement|fichier|namespace"   ({NS} = namespace saisi)
 # Quand preprod/prod passent en un fichier par namespace, remplacer
@@ -32,12 +36,13 @@ TARGETS=(
     "pcidss|pcidss/mep.token|{NS}"
 )
 ENVS=("hors-prod" "preprod" "prod" "pcidss")
-
+ 
 # Préfixes des namespaces (pour construire la liste proposée)
 NS_PREFIX_REGEX='^(dev|staging|preprod|alpha)-'
-
+ 
 # Cible SFTP d'un fichier du dépôt -> "utilisateur@hôte|chemin distant"
 # Vide = pas de dépôt SFTP pour ce fichier (le script le signale).
+SFTP_CREDS="${SFTP_CREDS:-$SCRIPT_DIR/sftp.credentials}"
 SFTP_HOST="deploy.runiso.com"
 SFTP_REMOTE="/token/istio-rke2/mep.token"
 sftp_for() {
@@ -50,7 +55,7 @@ sftp_for() {
     esac
 }
 # ============================================================================
-
+ 
 # ---------------------------------------------------------------- affichage
 if [[ -t 1 ]]; then
     B=$'\e[1m'; R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; N=$'\e[0m'
@@ -62,7 +67,7 @@ info()  { printf '%b\n' "$*"; }
 warn()  { printf '%s⚠️  %b%s\n' "$Y" "$*" "$N"; }
 title() { printf '\n%s━━ %s ━━%s\n' "$B$C" "$*" "$N"; }
 run()   { printf '  %s$ %s%s\n' "$Y" "$*" "$N"; "$@"; }
-
+ 
 ask_yn() {   # ask_yn "question" [défaut o|n]
     local def="${2:-n}" rep prompt="[o/N]"
     [[ "$def" == "o" ]] && prompt="[O/n]"
@@ -76,7 +81,7 @@ ask_yn() {   # ask_yn "question" [défaut o|n]
         esac
     done
 }
-
+ 
 choose() {   # choose "question" item... -> $CHOICE
     local q="$1"; shift
     local items=("$@") i rep
@@ -94,14 +99,14 @@ choose() {   # choose "question" item... -> $CHOICE
         info "${R}Choix invalide${N}"
     done
 }
-
+ 
 in_list() {  # in_list valeur liste...
     local v="$1"; shift
     local x
     for x in "$@"; do [[ "$x" == "$v" ]] && return 0; done
     return 1
 }
-
+ 
 # ---------------------------------------------------------------- JSON
 indent_of() {   # indentation utilisée par le fichier (2 ou 4 en général)
     local n
@@ -109,11 +114,11 @@ indent_of() {   # indentation utilisée par le fichier (2 ou 4 en général)
     [[ -z "$n" || "$n" -eq 0 ]] && n=4
     echo "$n"
 }
-
+ 
 ns_exists() {   # ns_exists fichier namespace
     jq -e --arg ns "$2" 'any(.namespaces[]; .namespace == $ns)' "$1" >/dev/null 2>&1
 }
-
+ 
 # apply fichier namespace mode(add|delete|clean) -> modifie le fichier en place
 apply() {
     local f="$1" ns="$2" mode="$3" tmp ind
@@ -138,35 +143,72 @@ apply() {
     cat "$tmp" > "$f"
     rm -f "$tmp"
 }
-
+ 
 # ---------------------------------------------------------------- SFTP
+sftp_password() {   # sftp_password utilisateur -> mot de passe (lu dans $SFTP_CREDS)
+    local user="$1" line k
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        k="${line%%=*}"
+        k="${k%"${k##*[![:space:]]}"}"          # espaces en fin de clé
+        if [[ "$k" == "$user" ]]; then
+            line="${line#*=}"                   # tout après le 1er '=' (le mdp peut en contenir)
+            echo "${line#"${line%%[![:space:]]*}"}"   # espaces après le '='
+            return 0
+        fi
+    done < "$SFTP_CREDS"
+    return 1
+}
+ 
 sftp_upload() {   # sftp_upload fichier_relatif
-    local rel="$1" cfg target remote stamp backup batch out size
+    local rel="$1" cfg target remote stamp backup batch out size user pw rc
     cfg=$(sftp_for "$rel")
     if [[ -z "$cfg" ]]; then
         warn "Pas de cible SFTP configurée pour ${B}$rel${N}${Y} (fonction sftp_for), à déposer à la main"
         return 0
     fi
     target="${cfg%%|*}"; remote="${cfg#*|}"
+    user="${target%%@*}"
+    if ! pw=$(sftp_password "$user") || [[ -z "$pw" ]]; then
+        warn "pas de mot de passe pour ${B}$user${N}${Y} dans $SFTP_CREDS, $rel non déposé"
+        return 0
+    fi
     mkdir -p "$BACKUP_DIR"
     stamp=$(date +%Y%m%d-%H%M%S)
     backup="$BACKUP_DIR/$(echo "$rel" | tr '/' '_').$stamp"
-
+ 
     info "\n📤 ${B}$rel${N} → $target:$remote"
     ask_yn "   Envoyer ?" o || { info "   ⏭️  ignoré"; return 0; }
-
+ 
     # '-' devant une commande = on ignore son erreur :
     #   -get : le dossier est normalement vide (fichier déjà consommé)
     #   -ls  : le serveur peut récupérer le fichier dès son arrivée
     batch=$(mktemp)
     printf -- '-get %s %s\nput %s %s\n-ls -l %s\n' \
         "$remote" "$backup" "$REPO_DIR/$rel" "$remote" "$remote" > "$batch"
-    if ! out=$(sftp -b "$batch" "$target" 2>&1); then
-        rm -f "$batch"; echo "$out" >&2
-        warn "échec SFTP pour $rel (clé SSH / ~/.ssh/config ?)"
-        return 0
+    # sshpass -e lit le mot de passe dans $SSHPASS (invisible dans ps).
+    # BatchMode=no est indispensable : sftp -b l'active et interdit alors le mot de passe.
+    if out=$(SSHPASS="$pw" sshpass -e sftp \
+                -o BatchMode=no \
+                -o PubkeyAuthentication=no \
+                -o PreferredAuthentications=password,keyboard-interactive \
+                -o StrictHostKeyChecking=accept-new \
+                -b "$batch" "$target" 2>&1); then
+        rc=0
+    else
+        rc=$?
     fi
     rm -f "$batch"
+    if (( rc != 0 )); then
+        echo "$out" >&2
+        case "$rc" in
+            5) warn "mot de passe refusé pour $user ($SFTP_CREDS)" ;;
+            6) warn "clé d'hôte inconnue pour $SFTP_HOST : connecte-toi une fois à la main (sftp $target)" ;;
+            *) warn "échec SFTP pour $rel (code $rc)" ;;
+        esac
+        return 0
+    fi
     size=$(wc -c < "$REPO_DIR/$rel" | tr -d ' ')
     if grep -q "[[:space:]]$size[[:space:]]" <<<"$out"; then
         info "   ${G}✅ déposé ($size octets)${N}"
@@ -176,23 +218,26 @@ sftp_upload() {   # sftp_upload fichier_relatif
     [[ -f "$backup" ]] && info "   💾 un mep.token non traité était présent, sauvegardé : $backup"
     return 0
 }
-
+ 
 # ---------------------------------------------------------------- prérequis
-for cmd in git jq sftp; do
+for cmd in git jq sftp sshpass; do
     command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' introuvable (brew install $cmd)"
 done
+[[ -f "$SFTP_CREDS" ]] || die "fichier d'identifiants SFTP absent : $SFTP_CREDS\n   → une ligne par compte : utilisateur=motdepasse, puis chmod 600"
+perms=$(ls -l "$SFTP_CREDS" | cut -c5-10)
+[[ "$perms" == "------" ]] || warn "$SFTP_CREDS est lisible par d'autres utilisateurs → chmod 600 \"$SFTP_CREDS\""
 [[ -d "$REPO_DIR/.git" ]] || die "$REPO_DIR n'est pas un dépôt git\n   → modifie REPO_DIR en haut du script"
 git -C "$REPO_DIR" remote get-url origin | grep -q 'k8s-deployment-management' \
     || die "$REPO_DIR ne pointe pas sur k8s-deployment-management"
-
+ 
 title "Gestion des comptes de service — mep.token"
-
+ 
 status=$(git -C "$REPO_DIR" status --porcelain)
 [[ -z "$status" ]] || die "le dépôt contient des modifications non commitées, nettoie avant :\n$status"
 info "🔄 Mise à jour du dépôt"
 run git -C "$REPO_DIR" pull --rebase --quiet
 cd "$REPO_DIR"
-
+ 
 # ---------------------------------------------------------------- 1. action
 choose "Que veux-tu faire ?" \
     "Ajouter des comptes de service" \
@@ -205,7 +250,7 @@ case "$CHOICE" in
     Nettoyer*)  MODE="clean";  ACTION="Nettoyage";   VERB="retirer de serviceaccounts_to_delete" ;;
     *)          MODE="upload" ;;
 esac
-
+ 
 if [[ "$MODE" == "upload" ]]; then
     FILES=()
     while IFS= read -r f; do FILES+=("${f#./}"); done < <(find . -name mep.token | sort)
@@ -214,7 +259,7 @@ if [[ "$MODE" == "upload" ]]; then
     info "\n🎉 Terminé"
     exit 0
 fi
-
+ 
 # ---------------------------------------------------------------- 2. namespace
 ALL_NS=()
 while IFS= read -r ns; do [[ -n "$ns" ]] && ALL_NS+=("$ns"); done < <(
@@ -227,7 +272,7 @@ while IFS= read -r ns; do [[ -n "$ns" ]] && ALL_NS+=("$ns"); done < <(
         done
     } | sed -E "s/$NS_PREFIX_REGEX//" | sort -u
 )
-
+ 
 NAMESPACE=""
 filtered=("${ALL_NS[@]}")
 while [[ -z "$NAMESPACE" ]]; do
@@ -253,7 +298,7 @@ while [[ -z "$NAMESPACE" ]]; do
     fi
 done
 info "→ Namespace : ${B}$NAMESPACE${N}"
-
+ 
 # ---------------------------------------------------------------- 3. environnements
 info "\n${B}Environnements ?${N}  (Entrée = tous, sinon numéros séparés par des espaces)"
 for i in "${!ENVS[@]}"; do printf '  %s%2d)%s %s\n' "$C" $((i + 1)) "$N" "${ENVS[$i]}"; done
@@ -273,7 +318,7 @@ while [[ ${#SEL_ENVS[@]} -eq 0 ]]; do
         done
     fi
 done
-
+ 
 # Résout les cibles (fichier + vrai namespace) et vérifie leur existence
 T_FILES=(); T_NS=()
 info "\n${B}Cibles :${N}"
@@ -293,7 +338,7 @@ for t in "${TARGETS[@]}"; do
 done
 [[ ${#T_FILES[@]} -gt 0 ]] || die "aucune cible valide pour '$NAMESPACE'"
 in_list "prod" "${SEL_ENVS[@]}" && info "${R}${B}⚠️  La PROD fait partie des cibles${N}"
-
+ 
 # Aide : pour le nettoyage, on affiche ce qu'il y a dans to_delete
 if [[ "$MODE" == "clean" ]]; then
     info "\nContenu actuel de serviceaccounts_to_delete :"
@@ -303,7 +348,7 @@ if [[ "$MODE" == "clean" ]]; then
         info "  ${T_NS[$i]} (${T_FILES[$i]}) : ${list:-<vide>}"
     done
 fi
-
+ 
 # ---------------------------------------------------------------- 4. comptes
 SAS=()
 while [[ ${#SAS[@]} -eq 0 ]]; do
@@ -323,16 +368,16 @@ while [[ ${#SAS[@]} -eq 0 ]]; do
 done
 SAS_JSON=$(printf '%s\n' "${SAS[@]}" | jq -R . | jq -s -c .)
 LIST=$(printf '%s, ' "${SAS[@]}"); LIST="${LIST%, }"
-
+ 
 info "\n${B}Référence du ticket${N} (SCTASK…, RITM…, Entrée si aucune) :"
 printf '> '
 read -r TICKET
-
+ 
 # ---------------------------------------------------------------- 5. modification
 for i in "${!T_FILES[@]}"; do
     apply "${T_FILES[$i]}" "${T_NS[$i]}" "$MODE"
 done
-
+ 
 CHANGED_FILES=()
 while IFS= read -r f; do [[ -n "$f" ]] && CHANGED_FILES+=("$f"); done \
     < <(git diff --name-only)
@@ -340,20 +385,20 @@ if [[ ${#CHANGED_FILES[@]} -eq 0 ]]; then
     info "\nRien à modifier (comptes déjà dans l'état voulu)."
     exit 0
 fi
-
+ 
 title "Récapitulatif"
 info "  Action        : ${B}$ACTION${N}"
 info "  Namespace     : ${B}$NAMESPACE${N}"
 info "  Comptes       : ${B}$LIST${N}"
 info "  Fichiers      : ${B}${CHANGED_FILES[*]}${N}\n"
 git --no-pager diff --color
-
+ 
 echo
 if ! ask_yn "Valider, commiter et pousser ?"; then
     git checkout -- "${CHANGED_FILES[@]}"
     die "annulé, fichiers remis dans leur état d'origine"
 fi
-
+ 
 MSG="$ACTION SA $LIST dans $NAMESPACE"
 [[ -n "$TICKET" ]] && MSG="$TICKET - $MSG"
 title "Commit & push"
@@ -361,13 +406,13 @@ run git add "${CHANGED_FILES[@]}"
 run git commit --quiet -m "$MSG"
 run git push --quiet
 info "${G}✅ Poussé sur $(git branch --show-current)${N}"
-
+ 
 # ---------------------------------------------------------------- 6. SFTP
 title "Dépôt SFTP"
 for f in "${CHANGED_FILES[@]}"; do
     sftp_upload "$f"
 done
-
+ 
 if [[ "$MODE" == "delete" ]]; then
     info "\n${Y}Rappel : une fois la suppression traitée, relance le script avec"
     info "« Nettoyer serviceaccounts_to_delete » pour vider la liste.${N}"
